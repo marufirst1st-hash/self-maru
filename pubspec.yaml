@@ -1,0 +1,33 @@
+name: floor_measure
+description: "Floor Measure - Smart spatial measurement app for flooring professionals"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  provider: 6.1.5+1
+  hive: 2.2.3
+  hive_flutter: 1.1.0
+  shared_preferences: 2.5.3
+  http: 1.5.0
+  crypto: ^3.0.3
+  path_provider: ^2.1.1
+  image_picker: ^1.1.2
+  uuid: ^4.2.1
+  intl: ^0.20.1
+  vector_math: ^2.1.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icons/
