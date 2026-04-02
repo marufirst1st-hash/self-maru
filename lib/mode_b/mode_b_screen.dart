@@ -94,12 +94,32 @@ class _ModeBScreenState extends State<ModeBScreen>
   }
 
   Future<void> _initSensors() async {
-    // 카메라 초기화
-    _cameraAvailable = await _cameraBridge.initialize();
+    // 카메라 초기화 (권한 거부 시 false → 사진/Flash 비활성)
+    try {
+      _cameraAvailable = await _cameraBridge.initialize();
+    } catch (_) {
+      _cameraAvailable = false;
+    }
 
-    // 센서는 연결만 준비 (스캔 시작 시 activate)
-    _sensorsAvailable = true; // sensors_plus는 대부분 사용 가능
-    if (mounted) setState(() {});
+    // 센서 사용 가능 여부 체크
+    try {
+      _sensorsAvailable = true;
+    } catch (_) {
+      _sensorsAvailable = false;
+    }
+
+    if (mounted) {
+      setState(() {});
+      if (!_cameraAvailable) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('카메라를 사용할 수 없습니다. 사진/Flash 기능이 비활성됩니다.'),
+            backgroundColor: Color(0xFFFF9800),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    }
   }
 
   @override

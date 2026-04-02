@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flutter pub:*)",
+      "Bash(flutter analyze:*)",
+      "Bash(flutter build:*)",
+      "Read(//c/Users/HP/AppData/Local/Temp/claude/c--Users-HP-self-maru/33bfa979-ff53-4e69-910e-cf25eea128ce/tasks/**)"
+    ]
+  }
+}

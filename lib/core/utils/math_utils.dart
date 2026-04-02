@@ -102,8 +102,9 @@ class MathUtils {
   ) {
     final det = a1 * b2 - a2 * b1;
     if (det.abs() < 1e-10) return null; // 평행
-    final x = (c1 * b2 - c2 * b1) / det;
-    final y = (a1 * c2 - a2 * c1) / det;
+    // ax + by + c = 0 → x = (b1*c2 - b2*c1)/det, y = (a2*c1 - a1*c2)/det
+    final x = (b1 * c2 - b2 * c1) / det;
+    final y = (a2 * c1 - a1 * c2) / det;
     return Offset(x, y);
   }
 

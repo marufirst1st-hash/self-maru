@@ -61,10 +61,25 @@ class _ModeAScreenState extends State<ModeAScreen>
   }
 
   Future<void> _initCamera() async {
-    _cameraReady = await _cameraBridge.initialize(
-      resolution: ResolutionPreset.high,
-    );
-    if (mounted) setState(() {});
+    try {
+      _cameraReady = await _cameraBridge.initialize(
+        resolution: ResolutionPreset.high,
+      );
+    } catch (_) {
+      _cameraReady = false;
+    }
+    if (mounted) {
+      setState(() {});
+      if (!_cameraReady) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('카메라 권한이 필요합니다. 설정에서 권한을 허용해주세요.'),
+            backgroundColor: Color(0xFFFF9800),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    }
   }
 
   @override
