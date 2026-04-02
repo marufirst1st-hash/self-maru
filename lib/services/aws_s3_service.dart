@@ -86,9 +86,7 @@ class AwsS3Service {
     final sortedHeaders = Map.fromEntries(
       headers.entries.toList()..sort((a, b) => a.key.toLowerCase().compareTo(b.key.toLowerCase())),
     );
-    final canonicalHeaders = sortedHeaders.entries
-        .map((e) => '${e.key.toLowerCase()}:${e.value.trim()}')
-        .join('\n') + '\n';
+    final canonicalHeaders = '${sortedHeaders.entries.map((e) => '${e.key.toLowerCase()}:${e.value.trim()}').join('\n')}\n';
     final signedHeaders = sortedHeaders.keys.map((k) => k.toLowerCase()).join(';');
 
     final canonicalRequest = [

@@ -10,17 +10,36 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
-  provider: 6.1.5+1
-  hive: 2.2.3
-  hive_flutter: 1.1.0
-  shared_preferences: 2.5.3
-  http: 1.5.0
-  crypto: ^3.0.3
+
+  # State management
+  provider: ^6.1.5
+
+  # Storage
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  shared_preferences: ^2.5.3
   path_provider: ^2.1.1
-  image_picker: ^1.1.2
+
+  # Network
+  http: ^1.5.0
+
+  # Core utils
+  crypto: ^3.0.3
   uuid: ^4.2.1
   intl: ^0.20.1
   vector_math: ^2.1.4
+
+  # Camera & Image
+  camera: ^0.11.0+2
+  image: ^4.3.0
+  image_picker: ^1.1.2
+
+  # Sensors (PDR)
+  sensors_plus: ^6.1.1
+
+  # Audio (Sonar) - just_audio for chirp playback
+  just_audio: ^0.9.36
+  # record: ^5.1.2  # TODO: 호환 버전 나오면 복원 (Sonar Worker 녹음용)
 
 dev_dependencies:
   flutter_test:
