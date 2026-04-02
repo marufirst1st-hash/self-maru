@@ -39,6 +39,7 @@ dependencies:
 
   # Audio (Sonar) - just_audio for chirp playback
   just_audio: ^0.9.36
+  opencv_dart: ^2.2.1+4
   # record: ^5.1.2  # TODO: 호환 버전 나오면 복원 (Sonar Worker 녹음용)
 
 dev_dependencies:

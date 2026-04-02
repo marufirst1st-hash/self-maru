@@ -1,82 +1,196 @@
+import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui';
+import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 /// AprilTag 검출 + 6DoF 포즈 추출
 /// 공식 A①
 ///
-/// opencv_dart ArUco 모듈로 AprilTag 36h11 검출
+/// opencv_dart의 ArUco 모듈로 AprilTag 36h11 검출
 /// solvePnP → 6DoF (위치+회전)
 class AprilTagDetector {
-  // 큐브 크기 (cm) → 마커 실제 크기
-  final double cubeSize; // 기본 15cm
-  final double stickerSize; // 기본 5cm
+  final double markerSizeCm;
+  cv.ArucoDetector? _detector;
+  bool _initialized = false;
 
-  AprilTagDetector({
-    this.cubeSize = 15.0,
-    this.stickerSize = 5.0,
-  });
+  AprilTagDetector({this.markerSizeCm = 15.0});
 
-  /// 카메라 이미지에서 태그 검출
-  /// TODO: opencv_dart 연동 시 실제 구현
-  List<TagResult> detect(dynamic cameraImage) {
-    // opencv_dart:
-    // final dict = ArucoDictionary.DICT_APRILTAG_36h11;
-    // final markers = detectMarkers(image, dict);
-    // markers.map → solvePnP → TagResult
-    return [];
+  void initialize() {
+    if (_initialized) return;
+    final dict = cv.ArucoDictionary.predefined(
+      cv.PredefinedDictionaryType.DICT_APRILTAG_36h11,
+    );
+    final params = cv.ArucoDetectorParameters.empty();
+    _detector = cv.ArucoDetector.create(dict, params);
+    _initialized = true;
   }
 
-  /// solvePnP: 마커 4코너 → 6DoF 포즈
-  /// objectPoints: 마커의 3D 좌표 (실제 크기 기준)
-  /// imagePoints: 이미지에서의 2D 좌표
-  TagResult? solvePnP({
-    required int tagId,
+  /// BGR Mat에서 태그 검출
+  List<TagResult> detectFromMat(cv.Mat image) {
+    if (!_initialized) initialize();
+
+    final (corners, ids, _) = _detector!.detectMarkers(image);
+    if (ids.length == 0) return [];
+
+    final results = <TagResult>[];
+    for (int i = 0; i < ids.length; i++) {
+      final tagId = ids[i];
+      final markerCorners = corners[i]; // VecPoint2f
+
+      final tagCorners = <Offset>[];
+      for (int j = 0; j < markerCorners.length; j++) {
+        final pt = markerCorners[j]; // Point2f
+        tagCorners.add(Offset(pt.x, pt.y));
+      }
+
+      final centerX = tagCorners.map((c) => c.dx).reduce((a, b) => a + b) / 4;
+      final centerY = tagCorners.map((c) => c.dy).reduce((a, b) => a + b) / 4;
+
+      results.add(TagResult(
+        tagId: tagId,
+        position2D: Offset(centerX, centerY),
+        imageCorners: tagCorners,
+        confidence: 0.95,
+        type: _classifyTag(tagId),
+      ));
+    }
+
+    corners.dispose();
+    ids.dispose();
+    return results;
+  }
+
+  /// CameraImage Y채널 → 검출
+  List<TagResult> detectFromYuv(
+    Uint8List yBytes,
+    int width,
+    int height,
+  ) {
+    if (!_initialized) initialize();
+
+    final mat = cv.Mat.fromList(height, width, cv.MatType.CV_8UC1, yBytes);
+    final bgr = cv.cvtColor(mat, cv.COLOR_GRAY2BGR);
+    final results = detectFromMat(bgr);
+    mat.dispose();
+    bgr.dispose();
+    return results;
+  }
+
+  /// solvePnP: 이미지 코너 + 카메라 파라미터 → 3D 포즈
+  TagPose? estimatePose({
     required List<Offset> imageCorners,
     required CameraIntrinsics camera,
-    required double markerSizeCm,
+    double? markerSize,
   }) {
-    if (imageCorners.length != 4) return null;
+    final size = (markerSize ?? markerSizeCm) / 2.0;
 
-    // TODO: opencv_dart solvePnP 호출
-    // final half = markerSizeCm / 2;
-    // objectPoints = [(-half,-half,0), (half,-half,0), (half,half,0), (-half,half,0)]
-    // rvec, tvec = solvePnP(objectPoints, imagePoints, K, dist)
-    // distance = tvec.norm / 100 (cm→m)
+    final objPoints = cv.Mat.fromList(4, 1, cv.MatType.CV_64FC3, [
+      -size, -size, 0.0,
+       size, -size, 0.0,
+       size,  size, 0.0,
+      -size,  size, 0.0,
+    ]);
 
-    return null;
+    final imgPoints = cv.Mat.fromList(4, 1, cv.MatType.CV_64FC2, [
+      imageCorners[0].dx, imageCorners[0].dy,
+      imageCorners[1].dx, imageCorners[1].dy,
+      imageCorners[2].dx, imageCorners[2].dy,
+      imageCorners[3].dx, imageCorners[3].dy,
+    ]);
+
+    final camMat = cv.Mat.fromList(3, 3, cv.MatType.CV_64FC1, [
+      camera.fx, 0.0, camera.cx,
+      0.0, camera.fy, camera.cy,
+      0.0, 0.0, 1.0,
+    ]);
+
+    final distCoeffs = cv.Mat.fromList(1, 5, cv.MatType.CV_64FC1, camera.distCoeffs);
+
+    try {
+      final (success, rvec, tvec) = cv.solvePnP(
+        objPoints, imgPoints, camMat, distCoeffs,
+      );
+
+      if (!success) {
+        _disposeAll([objPoints, imgPoints, camMat, distCoeffs]);
+        return null;
+      }
+
+      final tx = tvec.at<double>(0, 0);
+      final ty = tvec.at<double>(1, 0);
+      final tz = tvec.at<double>(2, 0);
+      final distance = math.sqrt(tx * tx + ty * ty + tz * tz) / 100;
+
+      final result = TagPose(
+        rvec: [rvec.at<double>(0, 0), rvec.at<double>(1, 0), rvec.at<double>(2, 0)],
+        tvec: [tx, ty, tz],
+        distance: distance,
+        worldPosition: Offset(tx / 100, ty / 100),
+      );
+
+      _disposeAll([objPoints, imgPoints, camMat, distCoeffs, rvec, tvec]);
+      return result;
+    } catch (_) {
+      _disposeAll([objPoints, imgPoints, camMat, distCoeffs]);
+      return null;
+    }
+  }
+
+  void _disposeAll(List<cv.Mat> mats) {
+    for (final m in mats) {
+      m.dispose();
+    }
+  }
+
+  TagType _classifyTag(int tagId) {
+    if (tagId < 100) return TagType.cube;
+    if (tagId < 200) return TagType.sticker;
+    return TagType.rod;
+  }
+
+  void dispose() {
+    _detector?.dispose();
+    _detector = null;
+    _initialized = false;
   }
 }
 
-/// 태그 검출 결과
 class TagResult {
   final int tagId;
-  final Offset position2D; // 이미지 상 중심 (픽셀)
-  final List<double> rvec; // 회전 벡터
-  final List<double> tvec; // 이동 벡터 (cm)
-  final double distance; // 카메라→태그 거리 (m)
+  final Offset position2D;
+  final List<Offset> imageCorners;
   final double confidence;
   final TagType type;
 
   const TagResult({
     required this.tagId,
     required this.position2D,
-    required this.rvec,
-    required this.tvec,
-    required this.distance,
+    this.imageCorners = const [],
     this.confidence = 0.95,
     this.type = TagType.unknown,
   });
+}
 
-  /// 월드 2D 좌표 (미터)
-  Offset get worldPosition => Offset(tvec[0] / 100, tvec[1] / 100);
+class TagPose {
+  final List<double> rvec;
+  final List<double> tvec;
+  final double distance;
+  final Offset worldPosition;
+
+  const TagPose({
+    required this.rvec,
+    required this.tvec,
+    required this.distance,
+    required this.worldPosition,
+  });
 }
 
 enum TagType { cube, sticker, rod, unknown }
 
-/// 카메라 내부 파라미터
 class CameraIntrinsics {
-  final double fx, fy; // 초점 거리 (픽셀)
-  final double cx, cy; // 주점 (픽셀)
-  final List<double> distCoeffs; // 왜곡 계수
+  final double fx, fy;
+  final double cx, cy;
+  final List<double> distCoeffs;
 
   const CameraIntrinsics({
     required this.fx,
@@ -85,4 +199,14 @@ class CameraIntrinsics {
     required this.cy,
     this.distCoeffs = const [0, 0, 0, 0, 0],
   });
+
+  factory CameraIntrinsics.estimate(int imageWidth, int imageHeight) {
+    final fx = imageWidth * 0.8;
+    return CameraIntrinsics(
+      fx: fx,
+      fy: fx,
+      cx: imageWidth / 2.0,
+      cy: imageHeight / 2.0,
+    );
+  }
 }

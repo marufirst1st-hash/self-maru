@@ -4,51 +4,42 @@ import '../core/models/corner.dart';
 
 /// 마커→벽/코너 매핑
 /// 공식 A③
-///
-/// 스티커(벽 위) → 벽의 한 점 + 법선
-/// 큐브(코너) → 코너 좌표
 class MarkerWallMapper {
-  /// 두 스티커 태그 → 벽
-  Wall wallFromStickers(TagResult sticker1, TagResult sticker2) {
-    return Wall(
-      start: sticker1.worldPosition,
-      end: sticker2.worldPosition,
-      confidence: 0.95,
-      source: 'marker',
-    );
-  }
-
-  /// 큐브 태그 → 코너
-  Corner cornerFromCube(TagResult cube) {
+  /// 큐브 태그 → 코너 (이미지 좌표 기반, 실제 월드 좌표는 solvePnP 후 사용)
+  Corner cornerFromTag(TagResult tag, {TagPose? pose}) {
+    // pose가 있으면 월드 좌표 사용, 없으면 이미지 좌표를 임시로
+    final pos = pose?.worldPosition ?? tag.position2D;
     return Corner(
-      position: cube.worldPosition,
-      confidence: 0.95,
+      position: pos,
+      confidence: tag.confidence,
       source: 'marker',
     );
   }
 
-  /// 감지된 태그 목록을 분류하여 벽/코너로 변환
-  MapperResult processDetections(List<TagResult> detections) {
+  /// 감지된 태그 목록을 분류하여 코너로 변환
+  MapperResult processDetections(List<TagResult> detections, {List<TagPose>? poses}) {
     final corners = <Corner>[];
     final walls = <Wall>[];
-    final stickers = <TagResult>[];
 
-    for (final tag in detections) {
+    for (int i = 0; i < detections.length; i++) {
+      final tag = detections[i];
+      final pose = poses != null && i < poses.length ? poses[i] : null;
+
       if (tag.type == TagType.cube) {
-        corners.add(cornerFromCube(tag));
-      } else if (tag.type == TagType.sticker) {
-        stickers.add(tag);
+        corners.add(cornerFromTag(tag, pose: pose));
       }
     }
 
-    // 인접 스티커 쌍 → 벽
-    for (int i = 0; i < stickers.length - 1; i++) {
-      for (int j = i + 1; j < stickers.length; j++) {
-        final dist = (stickers[i].worldPosition - stickers[j].worldPosition).distance;
-        // 같은 벽의 스티커: 0.5m ~ 10m 사이
-        if (dist > 0.5 && dist < 10.0) {
-          walls.add(wallFromStickers(stickers[i], stickers[j]));
-        }
+    // 인접 코너 쌍 → 벽
+    for (int i = 0; i < corners.length; i++) {
+      final j = (i + 1) % corners.length;
+      if (corners.length >= 2) {
+        walls.add(Wall(
+          start: corners[i].position,
+          end: corners[j].position,
+          confidence: 0.9,
+          source: 'marker',
+        ));
       }
     }
 

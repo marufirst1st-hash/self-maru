@@ -2,12 +2,16 @@ import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import '../core/models/corner.dart';
+import '../core/models/photo.dart';
 import '../core/models/room.dart';
 import '../core/engines/camera_bridge.dart';
 import '../core/output/floor_plan_renderer.dart';
 import '../core/workers/wall_constraint.dart';
 import '../core/workers/merger.dart';
 import '../screens/result_screen.dart';
+import '../screens/photo_review_sheet.dart';
+import 'apriltag_detector.dart';
+import 'marker_wall_mapper.dart';
 
 /// Mode A 스캔 화면: 마커 정밀 측정
 /// 카메라 프리뷰 + AprilTag 인식 (현재는 시뮬레이션 fallback)
@@ -40,15 +44,22 @@ class _ModeAScreenState extends State<ModeAScreen>
   bool _isCompleted = false;
   final List<Corner> _detectedCorners = [];
   final List<_DetectedMarker> _detectedMarkers = [];
+  final List<Photo> _photos = [];
   double _confidence = 0;
+  int _frameCount = 0;
+
+  // 태그 검출
+  final AprilTagDetector _tagDetector = AprilTagDetector();
+  final MarkerWallMapper _wallMapper = MarkerWallMapper();
 
   // 보정
   final WallConstraint _wallConstraint = WallConstraint();
   final Merger _merger = Merger();
 
-  // 시뮬레이션
+  // 시뮬레이션 fallback
   Timer? _simTimer;
   int _simStep = 0;
+  bool _useRealDetection = false;
 
   @override
   void initState() {
@@ -87,14 +98,88 @@ class _ModeAScreenState extends State<ModeAScreen>
     _pulseController.dispose();
     _simTimer?.cancel();
     _cameraBridge.dispose();
+    _tagDetector.dispose();
     super.dispose();
   }
 
   void _startScan() {
     setState(() => _isScanning = true);
-    // TODO: 실제 AprilTag 검출은 opencv_dart 연동 시 활성화
-    // 현재는 시뮬레이션
-    _runSimulation();
+
+    if (_cameraReady) {
+      _startRealDetection();
+    } else {
+      _runSimulation();
+    }
+  }
+
+  void _startRealDetection() {
+    _useRealDetection = true;
+    _tagDetector.initialize();
+
+    _cameraBridge.startImageStream((image) {
+      _frameCount++;
+      // 매 5프레임마다 검출 (성능)
+      if (_frameCount % 5 != 0) return;
+      if (!_isScanning || !mounted) return;
+
+      // Y 채널 추출
+      final yPlane = image.planes[0];
+      final results = _tagDetector.detectFromYuv(
+        yPlane.bytes,
+        image.width,
+        image.height,
+      );
+
+      if (results.isEmpty) return;
+
+      // 태그 → 코너/벽 매핑
+      final mapResult = _wallMapper.processDetections(results);
+
+      setState(() {
+        for (final tag in results) {
+          final alreadyDetected = _detectedMarkers.any((m) => m.tagId == tag.tagId);
+          if (!alreadyDetected) {
+            _detectedMarkers.add(_DetectedMarker(
+              tagId: tag.tagId,
+              type: tag.type.name,
+              position: tag.position2D,
+            ));
+          }
+        }
+
+        for (final corner in mapResult.corners) {
+          final alreadyExists = _detectedCorners.any(
+            (c) => (c.position - corner.position).distance < 0.3,
+          );
+          if (!alreadyExists) {
+            _detectedCorners.add(corner);
+          }
+        }
+
+        _confidence = _detectedMarkers.isEmpty
+            ? 0
+            : (_detectedCorners.length / 4 * 95).clamp(0, 97);
+      });
+    });
+  }
+
+  Future<void> _takePhoto() async {
+    final bytes = await _cameraBridge.capturePhoto();
+    if (bytes == null || !mounted) return;
+
+    final photo = await PhotoReviewSheet.show(
+      context,
+      imageBytes: bytes,
+      worldPosition: Offset.zero,
+    );
+
+    if (photo != null) {
+      setState(() => _photos.add(photo));
+      // 스트리밍 재개
+      if (_useRealDetection && _isScanning) {
+        _startRealDetection();
+      }
+    }
   }
 
   void _runSimulation() {
@@ -135,11 +220,16 @@ class _ModeAScreenState extends State<ModeAScreen>
   void _completeScan() {
     if (_isCompleted) return;
 
+    // 센서 정지
+    _cameraBridge.stopImageStream();
+    _simTimer?.cancel();
+
     final corrections = _wallConstraint.constrainedOptimize(_detectedCorners);
     _merger.addAll(corrections);
 
     final room = Room(
       corners: List.from(_detectedCorners),
+      photos: List.from(_photos),
       confidence: _confidence / 100,
       mode: 'A',
     );
@@ -173,6 +263,7 @@ class _ModeAScreenState extends State<ModeAScreen>
   void _cancelScan() {
     _simTimer?.cancel();
     _cameraBridge.stopImageStream();
+    _tagDetector.dispose();
     Navigator.pop(context);
   }
 
@@ -273,9 +364,66 @@ class _ModeAScreenState extends State<ModeAScreen>
               children: [
                 if (_isScanning || _isCompleted) ...[
                   _buildMarkerStatus(color),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 12),
                 ],
-                _buildActionButton(color),
+                if (_isScanning) ...[
+                  Row(
+                    children: [
+                      // 사진 촬영
+                      Expanded(
+                        child: SizedBox(
+                          height: 42,
+                          child: OutlinedButton.icon(
+                            onPressed: _cameraReady ? _takePhoto : null,
+                            icon: const Icon(Icons.camera_alt, size: 16),
+                            label: Text('사진${_photos.isNotEmpty ? ' (${_photos.length})' : ''}',
+                                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: const Color(0xFFFFD54F),
+                              side: BorderSide(color: const Color(0xFFFFD54F).withValues(alpha: 0.5)),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      // 스캔 중단
+                      Expanded(
+                        child: SizedBox(
+                          height: 42,
+                          child: OutlinedButton.icon(
+                            onPressed: _cancelScan,
+                            icon: const Icon(Icons.stop_circle_outlined, size: 16),
+                            label: const Text('중단', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.redAccent,
+                              side: const BorderSide(color: Colors.redAccent),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_detectedCorners.length >= 3) ...[
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 48,
+                      child: ElevatedButton.icon(
+                        onPressed: _completeScan,
+                        icon: const Icon(Icons.check_circle_outline, size: 18),
+                        label: const Text('측정 완료', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF66BB6A),
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                      ),
+                    ),
+                  ],
+                ] else
+                  _buildActionButton(color),
               ],
             ),
           ),
