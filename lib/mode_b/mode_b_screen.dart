@@ -1,22 +1,17 @@
-import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:arcore_flutter_plugin/arcore_flutter_plugin.dart';
+import 'package:vector_math/vector_math_64.dart' as vm;
 import '../core/models/corner.dart';
-import '../core/models/photo.dart';
 import '../core/models/room.dart';
-import '../core/engines/pdr_engine.dart';
-import '../core/engines/sensor_bridge.dart';
-import '../core/engines/camera_bridge.dart';
 import '../core/output/floor_plan_renderer.dart';
 import '../core/workers/wall_constraint.dart';
 import '../core/workers/merger.dart';
-import '../core/workers/flash_worker.dart';
-import '../core/workers/flash_bridge.dart';
-import '../core/utils/tier_detector.dart';
+import '../core/engines/pdr_engine.dart';
+import '../core/engines/sensor_bridge.dart';
 import '../screens/result_screen.dart';
-import '../screens/photo_review_sheet.dart';
 
-/// Mode B 스캔 화면: 스마트 측정 (걷기만)
-/// 실제 센서 연동: 가속도계+자이로(PDR) + 카메라(Flash Worker)
+/// Mode B: 스마트 측정
+/// ARCore 카메라(전체화면) → 평면 감지 → 탭으로 코너 → 실시간 도면
 class ModeBScreen extends StatefulWidget {
   final String projectName;
   final String? siteName;
@@ -33,386 +28,213 @@ class ModeBScreen extends StatefulWidget {
   State<ModeBScreen> createState() => _ModeBScreenState();
 }
 
-class _ModeBScreenState extends State<ModeBScreen>
-    with TickerProviderStateMixin {
-  late AnimationController _pulseController;
-  late AnimationController _scanLineController;
+class _ModeBScreenState extends State<ModeBScreen> {
+  ArCoreController? _arController;
 
-  // 측정 상태
-  bool _isScanning = false;
-  bool _isCompleted = false;
-  double _scanProgress = 0;
-  int _layerActive = 1;
-  double _confidence = 0;
-  final List<Corner> _detectedCorners = [];
-  Offset _currentPosition = Offset.zero;
-  double _currentHeading = 0;
-  int _stepCount = 0;
+  final List<Corner> _corners = [];
+  double _totalArea = 0;
+  double _totalPerimeter = 0;
 
-  // 실제 센서
+  // 보조: PDR 걸음 추적
   final PdrEngine _pdrEngine = PdrEngine();
   final SensorBridge _sensorBridge = SensorBridge();
-  final CameraBridge _cameraBridge = CameraBridge();
-  FlashWorker? _flashWorker;
-  FlashBridge? _flashBridge;
-  bool _sensorsAvailable = false;
-  bool _cameraAvailable = false;
+  int _stepCount = 0;
 
   // 보정
   final WallConstraint _wallConstraint = WallConstraint();
   final Merger _merger = Merger();
 
-  // PDR → 벽 추론 (걸은 경로에서 코너 추론)
-  final List<Offset> _walkPath = [];
-  DateTime? _lastCornerTime;
-
-  // 구독
-  final List<StreamSubscription> _subscriptions = [];
-
-  // 사진
-  final List<Photo> _photos = [];
-
   // 다중 방
   final List<Room> _completedRooms = [];
 
-  // 시뮬레이션 fallback
-  Timer? _simTimer;
-  int _simStep = 0;
-
-  @override
-  void initState() {
-    super.initState();
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1200),
-    )..repeat(reverse: true);
-    _scanLineController = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 2),
-    )..repeat();
-    _initSensors();
-  }
-
-  Future<void> _initSensors() async {
-    // 카메라 초기화 (권한 거부 시 false → 사진/Flash 비활성)
-    try {
-      _cameraAvailable = await _cameraBridge.initialize();
-    } catch (_) {
-      _cameraAvailable = false;
-    }
-
-    // 센서 사용 가능 여부 체크
-    try {
-      _sensorsAvailable = true;
-    } catch (_) {
-      _sensorsAvailable = false;
-    }
-
-    if (mounted) {
-      setState(() {});
-      if (!_cameraAvailable) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('카메라를 사용할 수 없습니다. 사진/Flash 기능이 비활성됩니다.'),
-            backgroundColor: Color(0xFFFF9800),
-            duration: Duration(seconds: 3),
-          ),
-        );
-      }
-    }
-  }
+  bool _arReady = false;
+  String _statusText = 'AR 초기화 중... 바닥을 비추세요';
 
   @override
   void dispose() {
-    _pulseController.dispose();
-    _scanLineController.dispose();
-    _simTimer?.cancel();
-    for (final sub in _subscriptions) {
-      sub.cancel();
-    }
+    _arController?.dispose();
     _sensorBridge.dispose();
     _pdrEngine.dispose();
-    _cameraBridge.dispose();
-    _flashBridge?.dispose();
-    _flashWorker?.dispose();
     super.dispose();
   }
 
-  void _startScan() {
-    setState(() => _isScanning = true);
+  void _onArCoreViewCreated(ArCoreController controller) {
+    _arController = controller;
 
-    if (_sensorsAvailable) {
-      _startRealScan();
-    } else {
-      _runSimulation();
-    }
-  }
+    // 평면 탭 → 코너 추가
+    _arController!.onPlaneTap = _onPlaneTap;
 
-  void _startRealScan() {
-    // PDR 시작
+    // 평면 감지 콜백
+    _arController!.onPlaneDetected = (plane) {
+      if (!_arReady && mounted) {
+        setState(() {
+          _arReady = true;
+          _statusText = '평면 감지됨! 코너 위치를 탭하세요';
+        });
+      }
+    };
+
+    // PDR 보조 시작
     _pdrEngine.start();
     _sensorBridge.connect(_pdrEngine);
-
-    // PDR 이벤트 수신
-    _subscriptions.add(
-      _pdrEngine.onStep.listen((step) {
-        if (!mounted) return;
-        setState(() {
-          _currentPosition = step.position;
-          _currentHeading = step.heading;
-          _stepCount = step.stepNumber;
-          _walkPath.add(step.position);
-          _scanProgress = (_stepCount / 40).clamp(0.0, 0.95); // ~40걸음이면 방 한 바퀴
-          _layerActive = _scanProgress < 0.25 ? 1 : _scanProgress < 0.5 ? 2 : _scanProgress < 0.75 ? 3 : 4;
-          _confidence = (_scanProgress * 90).clamp(0.0, 90.0);
-        });
-
-        // 걸음 패턴에서 코너 추론 (방향 급변 = 코너)
-        _detectCornerFromWalk(step);
-      }),
-    );
-
-    _subscriptions.add(
-      _pdrEngine.onPositionUpdate.listen((state) {
-        if (!mounted) return;
-        setState(() {
-          _currentPosition = state.position;
-          _currentHeading = state.heading;
-        });
-      }),
-    );
-
-    // Flash Worker (Tier에 따라)
-    if (_cameraAvailable && TierDetector.isWorkerEnabled('flash')) {
-      _flashWorker = FlashWorker();
-      _flashBridge = FlashBridge(
-        camera: _cameraBridge,
-        flashWorker: _flashWorker!,
-      );
-
-      _subscriptions.add(
-        _flashWorker!.corrections.listen((c) => _merger.onCorrection(c)),
-      );
-
-      // 카메라 프레임 스트리밍 (Flash 밝기 측정용)
-      _cameraBridge.startImageStream((image) {
-        _flashBridge?.onFrame(image);
-      });
-
-      _flashBridge!.start(interval: const Duration(seconds: 3));
-    }
-  }
-
-  /// 걸음 방향 급변 감지 → 코너 추론
-  void _detectCornerFromWalk(PdrStep step) {
-    if (_walkPath.length < 5) return;
-
-    // 최근 5걸음의 방향 변화량
-    final recent = _walkPath.length;
-    final p1 = _walkPath[recent - 5];
-    final p2 = _walkPath[recent - 3];
-    final p3 = _walkPath[recent - 1];
-
-    final dir1 = (p2 - p1).direction;
-    final dir2 = (p3 - p2).direction;
-    var angleDiff = (dir2 - dir1).abs();
-    if (angleDiff > 3.14) angleDiff = 6.28 - angleDiff;
-
-    // 45° 이상 방향 변화 = 코너 후보
-    if (angleDiff > 0.78) {
-      final now = DateTime.now();
-      // 최소 2초 간격
-      if (_lastCornerTime == null ||
-          now.difference(_lastCornerTime!).inMilliseconds > 2000) {
-        _lastCornerTime = now;
-        final newCorner = Corner(
-          position: step.position,
-          confidence: 0.7,
-          source: 'pdr',
-        );
-        setState(() {
-          _detectedCorners.add(newCorner);
-        });
-      }
-    }
-
-    // 출발점 근처로 돌아오면 (폐합) → 자동 완료
-    if (_stepCount > 10 && _detectedCorners.length >= 3) {
-      final startPos = _walkPath.first;
-      final currentPos = step.position;
-      if ((currentPos - startPos).distance < 0.8) {
-        _completeScan();
-      }
-    }
-  }
-
-  void _runSimulation() {
-    final demoCorners = [
-      Corner(position: const Offset(0, 0), confidence: 0.85, source: 'arcore'),
-      Corner(position: const Offset(4.8, 0), confidence: 0.82, source: 'arcore'),
-      Corner(position: const Offset(4.8, 3.6), confidence: 0.80, source: 'arcore'),
-      Corner(position: const Offset(0, 3.6), confidence: 0.88, source: 'arcore'),
-    ];
-
-    _simStep = 0;
-    _simTimer = Timer.periodic(const Duration(milliseconds: 800), (timer) {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-
-      setState(() {
-        _scanProgress = ((_simStep + 1) / 20.0).clamp(0.0, 1.0);
-        _layerActive = _scanProgress < 0.25 ? 1 : _scanProgress < 0.5 ? 2 : _scanProgress < 0.75 ? 3 : 4;
-        _confidence = (_scanProgress * 95).clamp(0.0, 95.0);
-
-        if (_simStep < demoCorners.length) {
-          _detectedCorners.add(demoCorners[_simStep]);
-        }
-      });
-
-      _simStep++;
-      if (_simStep >= 20) {
-        timer.cancel();
-        _completeScan();
-      }
+    _pdrEngine.onStep.listen((step) {
+      if (mounted) setState(() => _stepCount = step.stepNumber);
     });
   }
 
-  void _completeScan() {
-    if (_isCompleted) return;
+  /// 사용자가 평면을 탭 → 3D 좌표 → 코너
+  void _onPlaneTap(List<ArCoreHitTestResult> hits) {
+    if (hits.isEmpty) return;
+    final hit = hits.first;
 
-    // 센서 정지
-    _sensorBridge.disconnect();
-    _flashBridge?.stop();
-    _cameraBridge.stopImageStream();
+    // 3D 좌표에서 x, z를 2D 평면 좌표로 사용 (y=높이)
+    final pos3d = hit.pose.translation;
+    final worldPos = Offset(pos3d.x.toDouble(), pos3d.z.toDouble());
 
-    // Wall Constraint 적용
-    if (_detectedCorners.length >= 3) {
-      final corrections = _wallConstraint.constrainedOptimize(_detectedCorners);
-      _merger.addAll(corrections);
-    }
-
-    final room = Room(
-      corners: List.from(_detectedCorners),
-      photos: List.from(_photos),
-      confidence: _confidence / 100,
-      mode: 'B',
+    // 탭 위치에 빨간 구 노드 배치
+    final sphere = ArCoreSphere(
+      materials: [ArCoreMaterial(color: const Color(0xFFFF5252))],
+      radius: 0.03,
     );
+    final node = ArCoreNode(
+      shape: sphere,
+      position: pos3d,
+    );
+    _arController?.addArCoreNodeWithAnchor(node);
 
-    if (_detectedCorners.length >= 3) {
-      _merger.applyToRoom(room);
-      room.rebuildWalls();
+    // 이전 코너와의 거리선 표시 (벽)
+    if (_corners.isNotEmpty) {
+      final prev = _corners.last;
+      final prevPos = vm.Vector3(prev.position.dx, pos3d.y.toDouble(), prev.position.dy);
+      _addLine(prevPos, pos3d);
     }
 
-    _completedRooms.add(room);
+    final corner = Corner(
+      position: worldPos,
+      confidence: 0.9,
+      source: 'arcore',
+    );
 
     setState(() {
-      _isScanning = false;
-      _isCompleted = true;
-      _confidence = 92;
-    });
+      _corners.add(corner);
+      _recalculate();
 
-    Future.delayed(const Duration(milliseconds: 500), () {
-      if (mounted) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (_) => ResultScreen(
-              rooms: _completedRooms,
-              projectName: widget.projectName,
-              siteName: widget.siteName,
-              address: widget.address,
-              mode: 'B',
-            ),
-          ),
-        );
+      if (_corners.length == 1) {
+        _statusText = '1번 코너. 다음 코너를 탭하세요';
+      } else if (_corners.length == 2) {
+        _statusText = '2번 코너. 최소 1개 더 필요';
+      } else {
+        _statusText = '${_corners.length}번 코너 (${_totalArea.toStringAsFixed(2)}m²). 완료 가능!';
       }
     });
   }
 
-  void _manualComplete() {
-    if (_detectedCorners.length >= 3) {
-      _completeScan();
-    }
-  }
+  /// 두 점 사이에 얇은 실린더(선) 배치
+  void _addLine(vm.Vector3 from, vm.Vector3 to) {
+    final mid = (from + to) / 2.0;
+    final length = (to - from).length;
 
-  /// 사진 촬영
-  Future<void> _takePhoto() async {
-    final bytes = await _cameraBridge.capturePhoto();
-    if (bytes == null || !mounted) return;
-
-    final photo = await PhotoReviewSheet.show(
-      context,
-      imageBytes: bytes,
-      worldPosition: _currentPosition,
-      heading: _currentHeading,
+    final cylinder = ArCoreCylinder(
+      materials: [ArCoreMaterial(color: const Color(0xFF26C6DA).withValues(alpha: 0.8))],
+      radius: 0.005,
+      height: length,
     );
 
-    if (photo != null) {
-      setState(() => _photos.add(photo));
-      // Flash용 스트리밍 재개
-      if (_flashBridge != null && _isScanning) {
-        _cameraBridge.startImageStream((image) {
-          _flashBridge?.onFrame(image);
-        });
-      }
-    }
+    // 방향 계산 (기본 실린더는 Y축 방향)
+    final node = ArCoreNode(
+      shape: cylinder,
+      position: mid,
+    );
+    _arController?.addArCoreNodeWithAnchor(node);
   }
 
-  /// 현재 방 저장 후 다음 방 시작
-  void _nextRoom() {
-    if (_detectedCorners.length < 3) return;
+  void _recalculate() {
+    if (_corners.length < 3) {
+      _totalArea = 0;
+      _totalPerimeter = 0;
+      return;
+    }
+    final pts = _corners.map((c) => c.position).toList();
+    double area = 0, peri = 0;
+    for (int i = 0; i < pts.length; i++) {
+      final j = (i + 1) % pts.length;
+      area += pts[i].dx * pts[j].dy - pts[j].dx * pts[i].dy;
+      peri += (pts[j] - pts[i]).distance;
+    }
+    _totalArea = area.abs() / 2.0;
+    _totalPerimeter = peri;
+  }
 
-    // 현재 방 완성
-    final room = Room(
-      corners: List.from(_detectedCorners),
-      photos: List.from(_photos),
-      confidence: _confidence / 100,
-      mode: 'B',
-    );
+  void _undoLastCorner() {
+    if (_corners.isEmpty) return;
+    _corners.removeLast();
+    // ArCore 노드 제거는 복잡하므로 시각적으로만 무시
+    setState(() {
+      _recalculate();
+      _statusText = '코너 ${_corners.length}개';
+    });
+  }
+
+  void _completeRoom() {
+    if (_corners.length < 3) return;
+
+    final corrected = _corners.map((c) => c.copyWith()).toList();
+    final corrections = _wallConstraint.constrainedOptimize(corrected);
+    _merger.addAll(corrections);
+
+    final room = Room(corners: corrected, confidence: 0.9, mode: 'B');
     _merger.applyToRoom(room);
     room.rebuildWalls();
     _completedRooms.add(room);
 
-    // 상태 리셋 (센서는 유지)
-    setState(() {
-      _detectedCorners.clear();
-      _photos.clear();
-      _walkPath.clear();
-      _scanProgress = 0;
-      _confidence = 0;
-      _stepCount = 0;
-      _layerActive = 1;
-    });
-    _merger.clear();
-    _pdrEngine.reset();
+    _sensorBridge.disconnect();
+    _arController?.dispose();
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Room ${_completedRooms.length} 저장됨. 다음 방으로 이동하세요.'),
-        backgroundColor: const Color(0xFF66BB6A),
-        duration: const Duration(seconds: 2),
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ResultScreen(
+          rooms: _completedRooms,
+          projectName: widget.projectName,
+          siteName: widget.siteName,
+          address: widget.address,
+          mode: 'B',
+        ),
       ),
     );
   }
 
-  void _addManualCorner() {
+  void _nextRoom() {
+    if (_corners.length < 3) return;
+
+    final corrected = _corners.map((c) => c.copyWith()).toList();
+    final corrections = _wallConstraint.constrainedOptimize(corrected);
+    _merger.addAll(corrections);
+
+    final room = Room(corners: corrected, confidence: 0.9, mode: 'B');
+    _merger.applyToRoom(room);
+    room.rebuildWalls();
+    _completedRooms.add(room);
+
     setState(() {
-      _detectedCorners.add(Corner(
-        position: _currentPosition,
-        confidence: 0.9,
-        source: 'manual',
-      ));
+      _corners.clear();
+      _totalArea = 0;
+      _totalPerimeter = 0;
+      _statusText = 'Room ${_completedRooms.length + 1} - 코너를 탭하세요';
     });
+    _merger.clear();
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Room ${_completedRooms.length} 저장됨'),
+        backgroundColor: const Color(0xFF66BB6A),
+      ),
+    );
   }
 
   void _cancelScan() {
-    _simTimer?.cancel();
     _sensorBridge.disconnect();
-    _flashBridge?.stop();
-    _cameraBridge.stopImageStream();
-    _pdrEngine.stop();
+    _arController?.dispose();
     Navigator.pop(context);
   }
 
@@ -421,414 +243,183 @@ class _ModeBScreenState extends State<ModeBScreen>
     const color = Color(0xFF26C6DA);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0A0E1A),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF151926),
-        elevation: 0,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.white),
-          onPressed: _cancelScan,
-        ),
-        title: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: color.withValues(alpha: 0.2),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: const Text('B', style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.bold)),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(widget.projectName,
-                  style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600),
-                  overflow: TextOverflow.ellipsis),
-            ),
-          ],
-        ),
-        actions: [
-          if (_isScanning && _detectedCorners.length >= 3)
-            TextButton(
-              onPressed: _manualComplete,
-              child: const Text('완료', style: TextStyle(color: color, fontWeight: FontWeight.bold)),
-            ),
-        ],
-      ),
-      body: Column(
+      body: Stack(
         children: [
-          // 뷰파인더 / 도면
-          Expanded(
-            flex: 5,
-            child: Stack(
-              children: [
-                // 카메라 프리뷰 배경 (사용 가능할 때)
-                if (_cameraAvailable && _isScanning && _cameraBridge.controller != null)
-                  Positioned.fill(
-                    child: Opacity(
-                      opacity: 0.3,
-                      child: _cameraBridge.getPreview() ?? const SizedBox(),
-                    ),
-                  ),
+          // === ARCore 뷰 (전체화면) ===
+          ArCoreView(
+            onArCoreViewCreated: _onArCoreViewCreated,
+            enableTapRecognizer: true,
+            enableUpdateListener: true,
+          ),
 
-                // 도면 오버레이
-                if (_detectedCorners.isNotEmpty)
-                  Positioned.fill(
-                    child: CustomPaint(
-                      painter: FloorPlanRenderer(
-                        corners: _detectedCorners,
-                        currentPosition: _isScanning ? _currentPosition : null,
-                        currentHeading: _isScanning ? _currentHeading : null,
-                        isScanning: _isScanning,
-                        lineColor: color,
-                        cornerColor: color,
-                      ),
-                    ),
-                  )
-                else if (!_isScanning)
-                  _buildEmptyView(color),
-
-                // 스캔라인 애니메이션
-                if (_isScanning)
-                  AnimatedBuilder(
-                    animation: _scanLineController,
-                    builder: (_, __) => Positioned(
-                      top: 300 * _scanLineController.value,
-                      left: 0,
-                      right: 0,
-                      child: Container(
-                        height: 2,
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(colors: [
-                            Colors.transparent,
-                            color.withValues(alpha: 0.8),
-                            color,
-                            color.withValues(alpha: 0.8),
-                            Colors.transparent,
-                          ]),
-                        ),
-                      ),
-                    ),
-                  ),
-
-                // 상태 배지
-                Positioned(
-                  top: 16,
-                  right: 16,
-                  child: _buildStatusBadge(color),
+          // === 상단 바 ===
+          Positioned(
+            top: 0, left: 0, right: 0,
+            child: SafeArea(
+              child: Container(
+                margin: const EdgeInsets.all(12),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.7),
+                  borderRadius: BorderRadius.circular(14),
                 ),
-
-                // 센서 상태
-                if (_isScanning)
-                  Positioned(
-                    top: 16,
-                    left: 16,
-                    child: _buildSensorInfo(color),
-                  ),
-              ],
-            ),
-          ),
-
-          // 하단 패널
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: const BoxDecoration(
-              color: Color(0xFF151926),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (_isScanning || _isCompleted) ...[
-                  _buildProgress(color),
-                  const SizedBox(height: 12),
-                  _buildLayerIndicator(),
-                  const SizedBox(height: 16),
-                ],
-                if (_isScanning)
-                  _buildScanControls(color)
-                else
-                  _buildActionButton(color),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildEmptyView(Color color) {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          AnimatedBuilder(
-            animation: _pulseController,
-            builder: (_, __) => Icon(
-              Icons.directions_walk,
-              color: color.withValues(alpha: 0.5 + _pulseController.value * 0.3),
-              size: 64,
-            ),
-          ),
-          const SizedBox(height: 24),
-          Text('방 주위를 걸어다니세요', style: TextStyle(color: color, fontSize: 16, fontWeight: FontWeight.w600)),
-          const SizedBox(height: 8),
-          const Text('천천히 걸으며 방 전체를 스캔하세요', style: TextStyle(color: Colors.grey, fontSize: 13)),
-          if (_sensorsAvailable)
-            const Padding(
-              padding: EdgeInsets.only(top: 16),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.sensors, size: 14, color: Color(0xFF66BB6A)),
-                  SizedBox(width: 4),
-                  Text('센서 준비됨', style: TextStyle(color: Color(0xFF66BB6A), fontSize: 12)),
-                ],
+                child: Row(
+                  children: [
+                    GestureDetector(
+                      onTap: _cancelScan,
+                      child: const Icon(Icons.arrow_back, color: Colors.white, size: 22),
+                    ),
+                    const SizedBox(width: 12),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: color.withValues(alpha: 0.3),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Text('B', style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.bold)),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(widget.projectName,
+                          style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600),
+                          overflow: TextOverflow.ellipsis),
+                    ),
+                    if (_arReady)
+                      Container(width: 8, height: 8, decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFF66BB6A))),
+                    if (_stepCount > 0)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 8),
+                        child: Text('$_stepCount걸음', style: const TextStyle(color: Colors.white54, fontSize: 11)),
+                      ),
+                  ],
+                ),
               ),
             ),
+          ),
+
+          // === 실시간 도면 미니맵 (우상단) ===
+          if (_corners.length >= 2)
+            Positioned(
+              top: 100, right: 12,
+              child: Container(
+                width: 150, height: 150,
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.8),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: color.withValues(alpha: 0.4)),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: CustomPaint(
+                    painter: FloorPlanRenderer(
+                      corners: _corners,
+                      showDimensions: true,
+                      showArea: _corners.length >= 3,
+                      lineColor: color,
+                      cornerColor: const Color(0xFFFF5252),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // === 하단 패널 ===
+          Positioned(
+            bottom: 0, left: 0, right: 0,
+            child: SafeArea(
+              child: Container(
+                margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.8),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // 상태
+                    Text(_statusText,
+                        style: const TextStyle(color: Colors.white, fontSize: 13),
+                        textAlign: TextAlign.center),
+
+                    // 정보 칩
+                    if (_corners.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 6,
+                        children: [
+                          _chip('코너 ${_corners.length}', color),
+                          if (_totalArea > 0) _chip('${_totalArea.toStringAsFixed(2)} m²', const Color(0xFFFFD54F)),
+                          if (_totalPerimeter > 0) _chip('둘레 ${_totalPerimeter.toStringAsFixed(1)}m', Colors.white54),
+                          if (_completedRooms.isNotEmpty) _chip('${_completedRooms.length}방 완료', const Color(0xFF66BB6A)),
+                        ],
+                      ),
+                    ],
+
+                    const SizedBox(height: 10),
+
+                    // 버튼
+                    Row(
+                      children: [
+                        // 되돌리기
+                        if (_corners.isNotEmpty)
+                          _smallBtn(Icons.undo, '되돌리기', Colors.white54, _undoLastCorner),
+                        const Spacer(),
+                        // 다음 방
+                        if (_corners.length >= 3)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: _actionBtn('다음 방', color, _nextRoom),
+                          ),
+                        // 완료
+                        _actionBtn('완료', const Color(0xFF66BB6A), _corners.length >= 3 ? _completeRoom : null),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildStatusBadge(Color color) {
-    final label = _isCompleted ? '완료' : _isScanning ? '스캔 중' : '대기';
-    final badgeColor = _isCompleted ? const Color(0xFF66BB6A) : _isScanning ? color : Colors.grey;
+  Widget _chip(String text, Color c) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      decoration: BoxDecoration(
-        color: badgeColor.withValues(alpha: 0.2),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: badgeColor.withValues(alpha: 0.5)),
-      ),
-      child: Text(
-        _isScanning || _isCompleted ? '$label ${_confidence.toStringAsFixed(0)}%' : label,
-        style: TextStyle(color: badgeColor, fontSize: 12, fontWeight: FontWeight.w600),
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(color: c.withValues(alpha: 0.2), borderRadius: BorderRadius.circular(6)),
+      child: Text(text, style: TextStyle(color: c, fontSize: 11, fontWeight: FontWeight.w600)),
     );
   }
 
-  Widget _buildSensorInfo(Color color) {
-    return Container(
-      padding: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: const Color(0xFF151926).withValues(alpha: 0.9),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+  Widget _smallBtn(IconData icon, String label, Color c, VoidCallback? onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.directions_walk, size: 12, color: color),
-              const SizedBox(width: 4),
-              Text('$_stepCount 걸음', style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
-            ],
-          ),
-          const SizedBox(height: 2),
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.crop_square, size: 12, color: Colors.grey),
-              const SizedBox(width: 4),
-              Text('코너 ${_detectedCorners.length}개', style: const TextStyle(color: Colors.grey, fontSize: 11)),
-            ],
-          ),
-          if (_flashBridge != null)
-            const Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.flash_on, size: 12, color: Color(0xFFFFD54F)),
-                SizedBox(width: 4),
-                Text('Flash ON', style: TextStyle(color: Color(0xFFFFD54F), fontSize: 11)),
-              ],
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildProgress(Color color) {
-    final area = _detectedCorners.length >= 3 ? _calculateArea() : 0.0;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(children: [
-          const Text('측정 진행률', style: TextStyle(color: Colors.grey, fontSize: 13)),
-          const Spacer(),
-          Text('${(_scanProgress * 100).toInt()}%', style: TextStyle(color: color, fontSize: 13, fontWeight: FontWeight.bold)),
-        ]),
-        const SizedBox(height: 8),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(4),
-          child: LinearProgressIndicator(value: _scanProgress, backgroundColor: const Color(0xFF1E2235), valueColor: AlwaysStoppedAnimation(color), minHeight: 6),
-        ),
-        const SizedBox(height: 8),
-        Row(children: [
-          const Icon(Icons.crop_square, size: 14, color: Colors.grey),
+          Icon(icon, color: c, size: 20),
           const SizedBox(width: 4),
-          Text('코너: ${_detectedCorners.length}개', style: const TextStyle(color: Colors.grey, fontSize: 12)),
-          if (area > 0) ...[
-            const SizedBox(width: 16),
-            Icon(Icons.square_foot, size: 14, color: color),
-            const SizedBox(width: 4),
-            Text('면적: ${area.toStringAsFixed(2)} m²', style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600)),
-          ],
-        ]),
-      ],
-    );
-  }
-
-  Widget _buildLayerIndicator() {
-    final layers = ['PDR', 'Flash', 'Wall', 'Corner'];
-    return Row(
-      children: layers.asMap().entries.map((entry) {
-        final isActive = entry.key < _layerActive;
-        return Expanded(
-          child: Container(
-            margin: EdgeInsets.only(right: entry.key < 3 ? 4 : 0),
-            height: 4,
-            decoration: BoxDecoration(
-              color: isActive ? const Color(0xFF26C6DA) : const Color(0xFF1E2235),
-              borderRadius: BorderRadius.circular(2),
-            ),
-          ),
-        );
-      }).toList(),
-    );
-  }
-
-  Widget _buildScanControls(Color color) {
-    return Column(
-      children: [
-        // 도구 버튼 행
-        Row(
-          children: [
-            // 코너 추가
-            Expanded(
-              child: SizedBox(
-                height: 42,
-                child: OutlinedButton.icon(
-                  onPressed: _addManualCorner,
-                  icon: const Icon(Icons.add_location_alt, size: 16),
-                  label: const Text('코너', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: color,
-                    side: BorderSide(color: color.withValues(alpha: 0.5)),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            // 사진 촬영
-            Expanded(
-              child: SizedBox(
-                height: 42,
-                child: OutlinedButton.icon(
-                  onPressed: _cameraAvailable ? _takePhoto : null,
-                  icon: Icon(Icons.camera_alt, size: 16, color: _cameraAvailable ? const Color(0xFFFFD54F) : Colors.grey),
-                  label: Text('사진${_photos.isNotEmpty ? ' (${_photos.length})' : ''}',
-                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: const Color(0xFFFFD54F),
-                    side: BorderSide(color: const Color(0xFFFFD54F).withValues(alpha: 0.5)),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            // 스캔 중단
-            SizedBox(
-              height: 42,
-              width: 42,
-              child: IconButton(
-                onPressed: _cancelScan,
-                icon: const Icon(Icons.stop_circle_outlined, color: Colors.redAccent, size: 22),
-                style: IconButton.styleFrom(
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10),
-                    side: const BorderSide(color: Colors.redAccent),
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-        if (_detectedCorners.length >= 3) ...[
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              // 다음 방
-              Expanded(
-                child: SizedBox(
-                  height: 48,
-                  child: OutlinedButton.icon(
-                    onPressed: _nextRoom,
-                    icon: const Icon(Icons.add_home_outlined, size: 18),
-                    label: Text('다음 방${_completedRooms.isNotEmpty ? ' (${_completedRooms.length}완료)' : ''}',
-                        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: color,
-                      side: BorderSide(color: color),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              // 전체 완료
-              Expanded(
-                child: SizedBox(
-                  height: 48,
-                  child: ElevatedButton.icon(
-                    onPressed: _manualComplete,
-                    icon: const Icon(Icons.check_circle_outline, size: 18),
-                    label: const Text('측정 완료', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF66BB6A),
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
+          Text(label, style: TextStyle(color: c, fontSize: 12)),
         ],
-      ],
-    );
-  }
-
-  Widget _buildActionButton(Color color) {
-    return SizedBox(
-      width: double.infinity,
-      height: 52,
-      child: ElevatedButton.icon(
-        onPressed: _startScan,
-        icon: const Icon(Icons.directions_walk),
-        label: const Text('스마트 스캔 시작', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: color,
-          foregroundColor: Colors.white,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        ),
       ),
     );
   }
 
-  double _calculateArea() {
-    if (_detectedCorners.length < 3) return 0;
-    double sum = 0;
-    for (int i = 0; i < _detectedCorners.length; i++) {
-      final j = (i + 1) % _detectedCorners.length;
-      final pi = _detectedCorners[i].position;
-      final pj = _detectedCorners[j].position;
-      sum += pi.dx * pj.dy - pj.dx * pi.dy;
-    }
-    return sum.abs() / 2.0;
+  Widget _actionBtn(String label, Color c, VoidCallback? onTap) {
+    return SizedBox(
+      height: 40,
+      child: ElevatedButton(
+        onPressed: onTap,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: onTap != null ? c : c.withValues(alpha: 0.3),
+          foregroundColor: Colors.white,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          padding: const EdgeInsets.symmetric(horizontal: 18),
+        ),
+        child: Text(label, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+      ),
+    );
   }
 }
