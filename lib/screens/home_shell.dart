@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../core/updater/update_dialog.dart';
 import 'mode_select_screen.dart';
 import 'history_screen.dart';
 
@@ -17,6 +18,17 @@ class _HomeShellState extends State<HomeShell> {
     ModeSelectScreen(),
     HistoryScreen(),
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    // 앱 시작 후 1.5초 뒤 업데이트 체크 (UI 로딩 후)
+    Future.delayed(const Duration(milliseconds: 1500), () {
+      if (mounted) {
+        UpdateDialog.checkAndShow(context);
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
