@@ -37,14 +37,16 @@ dependencies:
   # Sensors (PDR)
   sensors_plus: ^6.1.1
 
-  # Audio (Sonar) - just_audio for chirp playback
+  # Audio (Sonar)
   just_audio: ^0.9.36
+  # record: ^5.1.2  # TODO: 호환 버전 나오면 복원
+
+  # OpenCV
   opencv_dart: ^2.2.1+4
+
+  # OTA Update
   package_info_plus: ^9.0.1
   dio: ^5.9.2
-  open_filex: ^4.7.0
-  arcore_flutter_plugin: ^0.1.0
-  # record: ^5.1.2  # TODO: 호환 버전 나오면 복원 (Sonar Worker 녹음용)
 
 dev_dependencies:
   flutter_test:
