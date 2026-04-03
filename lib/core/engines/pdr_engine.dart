@@ -44,8 +44,8 @@ class PdrEngine {
   int get stepCount => _stepCount;
 
   PdrEngine({
-    this.stepThresholdSigma = 0.7,
-    this.minStepIntervalMs = 300,
+    this.stepThresholdSigma = 1.2,
+    this.minStepIntervalMs = 400,
     this.complementaryAlpha = 0.96,
     this.weinbergK = 0.4,
   });
@@ -90,15 +90,18 @@ class PdrEngine {
     if (mag < _minAccel) _minAccel = mag;
 
     // 공식 ④ 걸음 감지
-    final threshold = _accelMean + stepThresholdSigma * _accelStd;
+    // 최소 임계값 1.5m/s² (노이즈로 인한 오감지 방지)
+    final threshold = (_accelMean + stepThresholdSigma * _accelStd).clamp(1.5, 20.0);
     final now = DateTime.now();
     final canStep = _lastStepTime == null ||
         now.difference(_lastStepTime!).inMilliseconds >= minStepIntervalMs;
 
     if (mag > threshold && canStep && _peakAccel > 0) {
       // 공식 ⑤ Weinberg 보폭
-      final stepLen =
+      final rawStepLen =
           MathUtils.weinbergStepLength(_peakAccel, _minAccel, K: weinbergK);
+      // 보폭 상한 1.2m (비현실적 값 방지)
+      final stepLen = rawStepLen.clamp(0.1, 1.2);
 
       // 공식 ⑦ 위치 갱신
       _position = MathUtils.updatePosition(_position, stepLen, _heading);

@@ -12,12 +12,11 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // ARCore PlatformView 등록
-        flutterEngine.platformViewsController.registry
-            .registerViewFactory(
-                "com.floormeasure/arcore_view",
-                ArCoreViewFactory(this, flutterEngine.dartExecutor.binaryMessenger)
-            )
+        // ARCore Texture 플러그인
+        ArCoreTexturePlugin(this, flutterEngine)
+
+        // Sonar 녹음 플러그인
+        SonarRecorder(flutterEngine, this)
 
         // APK 설치 채널
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, INSTALLER_CHANNEL)

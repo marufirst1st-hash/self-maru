@@ -10,9 +10,10 @@ class Merger {
 
   /// 보정값 도착 시 호출
   void onCorrection(Correction correction) {
-    _corrections
-        .putIfAbsent(correction.cornerId, () => [])
-        .add(correction);
+    final list = _corrections.putIfAbsent(correction.cornerId, () => []);
+    list.add(correction);
+    // 코너당 최대 50개 보정 유지 (메모리 + 최신 값 우선)
+    if (list.length > 50) list.removeAt(0);
   }
 
   /// 여러 보정값 일괄 추가

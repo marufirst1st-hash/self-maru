@@ -18,25 +18,33 @@ class SensorBridge {
     _running = true;
 
     // 가속도계 (50Hz 목표)
-    _accelSub = accelerometerEventStream(
-      samplingPeriod: const Duration(milliseconds: 20),
-    ).listen((event) {
-      pdr.onAccelerometerData(event.x, event.y, event.z);
-    });
+    try {
+      _accelSub = accelerometerEventStream(
+        samplingPeriod: const Duration(milliseconds: 20),
+      ).listen((event) {
+        pdr.onAccelerometerData(event.x, event.y, event.z);
+      });
+    } catch (_) {
+      // 가속도계 미지원 → PDR 걸음 감지 불가
+    }
 
     // 자이로스코프 (50Hz 목표)
     _lastGyroTime = DateTime.now();
-    _gyroSub = gyroscopeEventStream(
-      samplingPeriod: const Duration(milliseconds: 20),
-    ).listen((event) {
-      final now = DateTime.now();
-      final dt = now.difference(_lastGyroTime!).inMicroseconds / 1e6;
-      _lastGyroTime = now;
+    try {
+      _gyroSub = gyroscopeEventStream(
+        samplingPeriod: const Duration(milliseconds: 20),
+      ).listen((event) {
+        final now = DateTime.now();
+        final dt = now.difference(_lastGyroTime!).inMicroseconds / 1e6;
+        _lastGyroTime = now;
 
-      if (dt > 0 && dt < 0.1) {
-        pdr.onGyroscopeData(event.x, event.y, event.z, dt);
-      }
-    });
+        if (dt > 0 && dt < 0.1) {
+          pdr.onGyroscopeData(event.x, event.y, event.z, dt);
+        }
+      });
+    } catch (_) {
+      // 자이로 미지원 기기 → heading 추적 불가, AR 포즈로 보완
+    }
   }
 
   /// 센서 스트림 해제
