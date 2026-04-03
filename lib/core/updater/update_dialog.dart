@@ -74,7 +74,7 @@ class _UpdateDialogState extends State<UpdateDialog> {
   Future<void> _installApk(String path) async {
     final success = await _service.installApk(path);
     if (!success && mounted) {
-      setState(() => _error = 'APK 설치에 실패했습니다. 파일 관리자에서 직접 설치해주세요.');
+      setState(() => _error = '설치 권한을 허용한 후 "설치" 버튼을 다시 눌러주세요.');
     }
   }
 
