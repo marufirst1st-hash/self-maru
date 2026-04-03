@@ -64,7 +64,8 @@ class UpdateService {
     void Function(int received, int total)? onProgress,
   }) async {
     try {
-      final dir = await getApplicationDocumentsDirectory();
+      final dir = await getExternalStorageDirectory();
+      if (dir == null) return null;
       final filePath = '${dir.path}/floor_measure_update.apk';
 
       await _dio.download(
