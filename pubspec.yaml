@@ -1,7 +1,7 @@
 name: floor_measure
 description: "Floor Measure - Smart spatial measurement app for flooring professionals"
 publish_to: 'none'
-version: 1.1.4+6
+version: 1.1.5+7
 
 environment:
   sdk: ^3.9.2

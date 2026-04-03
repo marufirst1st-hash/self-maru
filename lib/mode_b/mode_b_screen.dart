@@ -110,8 +110,7 @@ class _ModeBScreenState extends State<ModeBScreen> {
     _subs.add(controller.onError.listen((error) {
       if (mounted) {
         setState(() {
-          _arAvailable = false;
-          _statusText = 'AR 오류. 수동 입력으로 전환됩니다.';
+          _statusText = 'AR: $error. 벽 추가 버튼으로 수동 입력 가능';
         });
       }
     }));
@@ -372,8 +371,7 @@ class _ModeBScreenState extends State<ModeBScreen> {
                       Text('되돌리기', style: TextStyle(color: Colors.white54, fontSize: 12)),
                     ])),
                   const Spacer(),
-                  if (!_arAvailable)
-                    Padding(padding: const EdgeInsets.only(right: 8), child: SizedBox(height: 40, child: ElevatedButton.icon(
+                  Padding(padding: const EdgeInsets.only(right: 8), child: SizedBox(height: 40, child: ElevatedButton.icon(
                       onPressed: _showDistanceInput,
                       icon: const Icon(Icons.straighten, size: 16),
                       label: const Text('벽 추가', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
