@@ -30,18 +30,18 @@ class WallPlane {
     return (minX: minX, maxX: maxX, minZ: minZ, maxZ: maxZ);
   }
 
-  /// 두 벽의 교차점 (범위 체크 포함)
+  /// 두 벽의 교차점 (범위 체크 + 각도 체크 + 근접 점 체크)
   static Offset? intersect(WallPlane w1, WallPlane w2) {
     final det = w1.a * w2.b - w2.a * w1.b;
-    if (det.abs() < 0.01) return null;
+    if (det.abs() < 0.05) return null; // 거의 평행 (각도 ~3도 미만)
 
     final x = (w1.b * w2.c - w2.b * w1.c) / det;
     final z = (w2.a * w1.c - w1.a * w2.c) / det;
 
-    // 교차점이 각 벽 inlier 범위 근처(margin)에 있는지
+    // 교차점이 각 벽 inlier 범위 근처에 있는지
     final b1 = w1.bounds;
     final b2 = w2.bounds;
-    const margin = 0.5;
+    const margin = 0.3;
 
     final inRange1 = x >= b1.minX - margin && x <= b1.maxX + margin &&
                      z >= b1.minZ - margin && z <= b1.maxZ + margin;
@@ -49,6 +49,22 @@ class WallPlane {
                      z >= b2.minZ - margin && z <= b2.maxZ + margin;
 
     if (!inRange1 || !inRange2) return null;
+
+    // 교차점에서 각 벽의 가장 가까운 실제 점까지 거리 체크
+    // 너무 멀면 실제로 만나지 않는 벽
+    double minDist1 = double.infinity;
+    for (final p in w1.inliers) {
+      final d = math.sqrt((p.x - x) * (p.x - x) + (p.z - z) * (p.z - z));
+      if (d < minDist1) minDist1 = d;
+    }
+    double minDist2 = double.infinity;
+    for (final p in w2.inliers) {
+      final d = math.sqrt((p.x - x) * (p.x - x) + (p.z - z) * (p.z - z));
+      if (d < minDist2) minDist2 = d;
+    }
+    // 양쪽 벽 모두 교차점에서 1m 이내에 실제 점이 있어야
+    if (minDist1 > 1.0 || minDist2 > 1.0) return null;
+
     return Offset(x, z);
   }
 }
@@ -59,6 +75,7 @@ List<WallPlane> findWallsRANSAC(
   int maxIterations = 200,
   double distanceThreshold = 0.08,
   int minInliers = 5,
+  int maxWalls = 20,
 }) {
   final walls = <WallPlane>[];
   var remaining = List<Point3D>.from(points);
@@ -99,6 +116,7 @@ List<WallPlane> findWallsRANSAC(
 
     if (bestPlane == null || bestCount < minInliers) break;
     walls.add(bestPlane);
+    if (walls.length >= maxWalls) break;
     final inlierSet = bestPlane.inliers.toSet();
     remaining = remaining.where((p) => !inlierSet.contains(p)).toList();
   }

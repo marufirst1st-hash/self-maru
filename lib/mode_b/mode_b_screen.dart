@@ -442,7 +442,7 @@ class _ModeBScreenState extends State<ModeBScreen> with WidgetsBindingObserver {
     }
 
     // 4. RANSAC으로 벽 찾기
-    final walls = findWallsRANSAC(wallPoints, minInliers: 3);
+    final walls = findWallsRANSAC(wallPoints);
 
     // 5. 벽 교차점 = 코너
     final newCorners = findCorners(walls);
