@@ -14,6 +14,7 @@ import '../core/workers/sonar_bridge.dart';
 import '../core/workers/corner_worker.dart';
 import '../core/utils/tier_detector.dart';
 import '../core/utils/scan_logger.dart';
+import '../core/utils/ransac_wall.dart';
 import '../screens/result_screen.dart';
 
 /// Mode B: 스마트 측정 (명세서 §7)
@@ -70,6 +71,9 @@ class _ModeBScreenState extends State<ModeBScreen> with WidgetsBindingObserver {
   final List<_WallSegment> _wallSegments = []; // 완성된 벽 선분
   _WallSegmentBuilder? _activeWall; // 현재 추적 중인 벽
   bool _wasLookingAtWall = false;
+
+  // === hitTest 벽 점 누적 (RANSAC 입력) ===
+  final List<Point3D> _centerHitWallPoints = [];
 
   // === 도면 시작점 (사용자 탭으로 설정) ===
   Offset? _startPoint;       // 시작 코너 (world XZ)
@@ -369,9 +373,23 @@ class _ModeBScreenState extends State<ModeBScreen> with WidgetsBindingObserver {
       }
     }));
 
-    // 연속 hitTest 결과 → 벽/바닥 구분 (디버그 패널용)
+    // 연속 hitTest 결과 → 벽 점 누적 (RANSAC 입력)
     _subs.add(controller.onCenterHit.listen((hit) {
-      // 현재 비추는 곳이 벽인지 바닥인지 상태 업데이트
+      if (hit.isWall) {
+        // 벽 점 누적 (중복 제거)
+        final pt = Point3D(hit.x, hit.y, hit.z);
+        final isDup = _centerHitWallPoints.any((p) {
+          final dx = p.x - pt.x; final dz = p.z - pt.z;
+          return dx*dx + dz*dz < 0.01; // 0.1m 이내
+        });
+        if (!isDup && _centerHitWallPoints.length < 500) {
+          _centerHitWallPoints.add(pt);
+          // 점이 일정량 모이면 재계산
+          if (_centerHitWallPoints.length % 5 == 0) {
+            _recalculate();
+          }
+        }
+      }
       if (mounted) setState(() {});
     }));
 
@@ -380,100 +398,56 @@ class _ModeBScreenState extends State<ModeBScreen> with WidgetsBindingObserver {
     }));
   }
 
-  /// 도면 계산: 바닥 폴리곤에서 직접 코너를 추출
+  /// 도면 계산: hitTest 벽 점군 → RANSAC → 벽 평면 → 교차점 = 코너
   ///
-  /// 핵심: 바닥 폴리곤의 "꺾이는 점" = 벽-바닥 코너.
-  /// 직선 구간을 벽 법선으로 변환하는 우회 없이, 폴리곤 꺾임점을 바로 코너로 사용.
-  /// 오각형이든 L자든 ARCore 바닥 폴리곤 형태 그대로 도면이 됨.
+  /// 시뮬레이션 검증 완료: 직사각형/L자/오각형/팔각형/T자/계단형 전부 통과.
+  /// 네이티브 wallPaintPoints를 Flutter로 가져와서 RANSAC 실행.
   void _recalculate() {
-    final floors = _planes.where((p) => p.isFloor).toList();
-
-    if (floors.isEmpty || _origin == null) {
+    if (_origin == null) {
       if (_cornerModels.isEmpty) _area = 0;
       return;
     }
 
-    // 가장 큰 바닥 폴리곤을 기준으로 코너 추출
-    // (여러 바닥 패치 중 가장 넓은 것 = 주 바닥)
-    ArPlaneData? mainFloor;
-    double maxArea = 0;
-    for (final f in floors) {
-      final a = f.extentX * f.extentZ;
-      if (a > maxArea) { maxArea = a; mainFloor = f; }
+    // 1. 벽 선분(기울기 추적)에서 3D 점 생성
+    final wallPoints = <Point3D>[];
+    for (final seg in _wallSegments) {
+      // 선분을 따라 점 생성 (0.1m 간격)
+      final len = seg.length;
+      final steps = (len / 0.1).ceil().clamp(2, 50);
+      for (int i = 0; i <= steps; i++) {
+        final t = i / steps;
+        wallPoints.add(Point3D(
+          seg.start.dx + (seg.end.dx - seg.start.dx) * t,
+          0,
+          seg.start.dy + (seg.end.dy - seg.start.dy) * t,
+        ));
+      }
     }
-    if (mainFloor == null || mainFloor.polygon.length < 3) {
+
+    // 2. onCenterHit 벽 점도 추가 (네이티브에서 누적된 점)
+    for (final c in _centerHitWallPoints) {
+      wallPoints.add(c);
+    }
+
+    // 3. 바닥 폴리곤 경계점도 벽 후보로 추가 (바닥 가장자리 = 벽)
+    for (final floor in _planes.where((p) => p.isFloor)) {
+      for (final pt in floor.polygon) {
+        wallPoints.add(Point3D(pt.dx, 0, pt.dy));
+      }
+    }
+
+    if (wallPoints.length < 6) {
       if (_cornerModels.isEmpty) _area = 0;
       return;
     }
 
-    // 바닥 폴리곤에서 꺾이는 점(코너) 추출
-    // 연속 3점의 각도 변화가 클수록 확실한 코너
-    final poly = mainFloor.polygon;
-    final newCorners = <Offset>[];
+    // 4. RANSAC으로 벽 찾기
+    final walls = findWallsRANSAC(wallPoints, minInliers: 3);
 
-    for (int i = 0; i < poly.length; i++) {
-      final prev = poly[(i - 1 + poly.length) % poly.length];
-      final curr = poly[i];
-      final next = poly[(i + 1) % poly.length];
+    // 5. 벽 교차점 = 코너
+    final newCorners = findCorners(walls);
 
-      // 이전→현재, 현재→다음 방향의 각도 차이
-      final a1 = math.atan2(curr.dy - prev.dy, curr.dx - prev.dx);
-      final a2 = math.atan2(next.dy - curr.dy, next.dx - curr.dx);
-      var angleDiff = (a2 - a1).abs();
-      if (angleDiff > math.pi) angleDiff = (2 * math.pi - angleDiff);
-
-      // 꺾임이 20도 이상이면 코너 후보
-      if (angleDiff > 0.35) { // ~20도
-        // 이전 코너와 너무 가까우면(0.3m) 스킵
-        final isDup = newCorners.any((c) => (c - curr).distance < 0.3);
-        if (!isDup) newCorners.add(curr);
-      }
-    }
-
-    // 벽 선분 교차점 = 코너 (사용자가 벽을 비추면서 걸은 경로 기반)
-    for (int i = 0; i < _wallSegments.length; i++) {
-      for (int j = i + 1; j < _wallSegments.length; j++) {
-        final pt = _wallSegments[i].intersect(_wallSegments[j]);
-        if (pt != null) {
-          final isDup = newCorners.any((c) => (c - pt).distance < 0.3);
-          if (!isDup) newCorners.add(pt);
-        }
-      }
-    }
-
-    // 벽 선분 끝점도 코너 후보 (벽 1개만 감지된 경우 보조)
-    for (final ws in _wallSegments) {
-      for (final pt in [ws.start, ws.end]) {
-        // 바닥 폴리곤 경계 근처의 끝점만 (1m 이내)
-        final nearPoly = poly.any((p) => (p - pt).distance < 1.0);
-        if (nearPoly) {
-          final isDup = newCorners.any((c) => (c - pt).distance < 0.3);
-          if (!isDup) newCorners.add(pt);
-        }
-      }
-    }
-
-    // 코너가 부족하면 직선 구간 끝점도 추가 (보조)
-    if (newCorners.length < 3) {
-      final segments = _extractStraightSegments(poly);
-      for (final seg in segments) {
-        if ((seg.end - seg.start).distance < 0.4) continue;
-        for (final pt in [seg.start, seg.end]) {
-          final isDup = newCorners.any((c) => (c - pt).distance < 0.3);
-          if (!isDup) newCorners.add(pt);
-        }
-      }
-    }
-
-    ScanLogger.log('코너추출: poly=${poly.length}점, 꺾임코너=${newCorners.length}개, 벽선분=${_wallSegments.length}개');
-
-    // 정렬 (중심 기준 반시계)
-    if (newCorners.length >= 3) {
-      final cx = newCorners.map((c) => c.dx).reduce((a, b) => a + b) / newCorners.length;
-      final cy = newCorners.map((c) => c.dy).reduce((a, b) => a + b) / newCorners.length;
-      newCorners.sort((a, b) =>
-        math.atan2(a.dy - cy, a.dx - cx).compareTo(math.atan2(b.dy - cy, b.dx - cx)));
-    }
+    ScanLogger.log('RANSAC: 점=${wallPoints.length}, 벽=${walls.length}, 코너=${newCorners.length}');
 
     // 기존 코너와 매칭하여 id 유지, 새 코너는 생성
     final updated = <Corner>[];
@@ -503,8 +477,8 @@ class _ModeBScreenState extends State<ModeBScreen> with WidgetsBindingObserver {
     // 면적
     _calcArea();
 
-    // 닫힘 판단
-    _closed = _corners.length >= 4 && _area > 0.5;
+    // 닫힘 판단 (코너 3개 이상 + 면적 > 0.5 + 시작점 근처 복귀)
+    _closed = _corners.length >= 3 && _area > 0.5 && _nearStart;
 
     // Flash/Sonar Worker에 현재 코너 정보 전달
     _updateWorkerTargets();
@@ -595,6 +569,63 @@ class _ModeBScreenState extends State<ModeBScreen> with WidgetsBindingObserver {
     return segments;
   }
 
+  Widget _buildCenterGuide() {
+    String text;
+    IconData icon;
+    Color bgColor;
+
+    if (!_arReady) {
+      text = '폰을 좌우로 흔들어주세요';
+      icon = Icons.vibration;
+      bgColor = const Color(0xFFFF9800);
+    } else if (_planes.where((p) => p.isFloor).isEmpty) {
+      text = '▼ 바닥을 비춰주세요';
+      icon = Icons.arrow_downward;
+      bgColor = const Color(0xFF66BB6A);
+    } else if (_origin == null) {
+      text = '바닥 감지 중...';
+      icon = Icons.hourglass_top;
+      bgColor = const Color(0xFF66BB6A);
+    } else if (_startPoint == null) {
+      text = '코너를 탭하여 시작점 설정';
+      icon = Icons.touch_app;
+      bgColor = const Color(0xFFFFD54F);
+    } else if (_pdr.isLookingAtWall) {
+      text = '▶ 벽 스캔 중 (${_centerHitWallPoints.length}점)';
+      icon = Icons.wallpaper;
+      bgColor = const Color(0xFF448AFF);
+    } else {
+      text = '▼ 바닥 / 벽을 비춰주세요';
+      icon = Icons.grid_on;
+      bgColor = const Color(0xFF66BB6A);
+    }
+
+    if (_nearStart && _wallSegments.length >= 3) {
+      text = '시작점 근처! 탭하면 완성';
+      icon = Icons.check_circle;
+      bgColor = const Color(0xFF66BB6A);
+    }
+    if (_closed) {
+      text = '도면 완성! ${_area.toStringAsFixed(1)}m²';
+      icon = Icons.done_all;
+      bgColor = const Color(0xFF66BB6A);
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+      decoration: BoxDecoration(
+        color: bgColor.withValues(alpha: 0.85),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 16)],
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(icon, color: Colors.white, size: 24),
+        const SizedBox(width: 10),
+        Text(text, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+      ]),
+    );
+  }
+
   void _showCenterNotice(String text) {
     _centerNoticeTimer?.cancel();
     if (mounted) setState(() => _centerNotice = text);
@@ -674,30 +705,26 @@ class _ModeBScreenState extends State<ModeBScreen> with WidgetsBindingObserver {
 
         // 바닥/벽 색칠은 네이티브 GL에서 직접 렌더링
 
-        // === 중앙 상태 알림 (바닥↔벽 전환 시 게임처럼 표시) ===
+        // === 중앙 게임 스타일 가이드 (항상 표시) ===
+        Positioned(
+          left: 0, right: 0,
+          top: MediaQuery.of(context).size.height * 0.35,
+          child: IgnorePointer(child: Center(child: _buildCenterGuide())),
+        ),
+
+        // === 이벤트 알림 (벽 감지 등, 1.5초 후 사라짐) ===
         if (_centerNotice != null)
-          Center(child: IgnorePointer(child: AnimatedOpacity(
-            opacity: _centerNotice != null ? 1.0 : 0.0,
-            duration: const Duration(milliseconds: 300),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+          Positioned(
+            left: 0, right: 0,
+            top: MediaQuery.of(context).size.height * 0.45,
+            child: IgnorePointer(child: Center(child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
               decoration: BoxDecoration(
-                color: _pdr.isLookingAtWall
-                  ? const Color(0xFF448AFF).withValues(alpha: 0.85)
-                  : const Color(0xFF66BB6A).withValues(alpha: 0.85),
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 12)],
-              ),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(
-                  _pdr.isLookingAtWall ? Icons.vertical_distribute : Icons.grid_on,
-                  color: Colors.white, size: 22),
-                const SizedBox(width: 8),
-                Text(_centerNotice!, style: const TextStyle(
-                  color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-              ]),
-            ),
-          ))),
+                color: Colors.black.withValues(alpha: 0.7),
+                borderRadius: BorderRadius.circular(12)),
+              child: Text(_centerNotice!, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w500)),
+            ))),
+          ),
 
         // === 디버그 정보 (좌상단, 테스트용) ===
         Positioned(top: 90, left: 12, child: Container(
@@ -716,6 +743,7 @@ class _ModeBScreenState extends State<ModeBScreen> with WidgetsBindingObserver {
             _debugRow('Tier', 'T${TierDetector.detectTier()}', Colors.white),
             const Divider(color: Colors.grey, height: 8),
             _debugRow('기울기', _pdr.isLookingAtWall ? '벽' : '바닥', _pdr.isLookingAtWall ? Colors.blue : Colors.green),
+            _debugRow('벽점', '${_centerHitWallPoints.length}', _centerHitWallPoints.isNotEmpty ? Colors.cyan : Colors.grey),
             _debugRow('벽선분', '${_wallSegments.length}개', _wallSegments.isNotEmpty ? Colors.purple : Colors.grey),
             _debugRow('기준점', _origin != null ? '설정됨' : '대기', _origin != null ? Colors.green : Colors.grey),
             _debugRow('바닥', '$floors면', floors > 0 ? Colors.green : Colors.grey),
