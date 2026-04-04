@@ -49,9 +49,14 @@ class ArCoreTexturePlugin(
     private var flashOnStartMs = 0L
     private var lastCornerMs = 0L
     private var lastHitTestMs = 0L
-    // 누적된 벽/바닥 색칠 점 (월드 좌표): [x,y,z, x,y,z, ...]
-    private val wallPaintPoints = mutableListOf<FloatArray>() // 벽 hit 점
-    private val floorPaintPoints = mutableListOf<FloatArray>() // 바닥 hit 점
+    // 누적된 벽/바닥 hit 점 (월드 좌표)
+    private val wallPaintPoints = mutableListOf<FloatArray>() // [x,y,z]
+    private val floorPaintPoints = mutableListOf<FloatArray>() // [x,y,z]
+    // RANSAC으로 찾은 3D 벽 면 (GL quad로 렌더링)
+    // 각 벽: [x1,y1,z1, x2,y2,z2, x3,y3,z3, x4,y4,z4] (4꼭지점)
+    private val wallQuads = mutableListOf<FloatArray>()
+    private var lastRansacMs = 0L
+    private var floorY = 0f // 바닥 높이
 
     init {
         channel.setMethodCallHandler { call, result ->
@@ -306,46 +311,83 @@ class ArCoreTexturePlugin(
                                 GLES20.glDisableVertexAttribArray(ovPosLoc)
                             }
 
-                            // === 누적 hitTest 점 색칠 (월드 좌표 고정 = 다시 비춰도 유지) ===
+                            // === 3D 벽/바닥 면 렌더링 (월드 좌표 고정) ===
                             GLES20.glUseProgram(ptProg)
                             val vpMat = multiplyMM(projMat, viewMat)
                             GLES20.glUniformMatrix4fv(ptVpLoc, 1, false, vpMat, 0)
 
-                            fun drawPoints3D(points: List<FloatArray>, r: Float, g: Float, b: Float, a: Float, vertical: Boolean) {
-                                if (points.isEmpty()) return
-                                GLES20.glUniform4f(ptColorLoc, r, g, b, a)
-                                val size = 0.04f
-                                val verts = FloatArray(points.size * 6 * 3)
-                                for ((idx, pt) in points.withIndex()) {
+                            // 벽 quad (RANSAC으로 생성된 3D 사각형)
+                            for (quad in wallQuads) {
+                                if (quad.size < 12) continue
+                                // 파란 반투명 벽면
+                                GLES20.glUniform4f(ptColorLoc, 0.2f, 0.4f, 0.9f, 0.25f)
+                                // 2 triangles: (0,1,2), (0,2,3)
+                                val triVerts = floatArrayOf(
+                                    quad[0],quad[1],quad[2], quad[3],quad[4],quad[5], quad[6],quad[7],quad[8],
+                                    quad[0],quad[1],quad[2], quad[6],quad[7],quad[8], quad[9],quad[10],quad[11],
+                                )
+                                val vb = buf(triVerts)
+                                GLES20.glEnableVertexAttribArray(ptPosLoc)
+                                GLES20.glVertexAttribPointer(ptPosLoc, 3, GLES20.GL_FLOAT, false, 0, vb)
+                                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, 6)
+
+                                // 벽 외곽선 (좀 더 진하게)
+                                GLES20.glUniform4f(ptColorLoc, 0.2f, 0.5f, 1.0f, 0.6f)
+                                val edgeVerts = buf(quad)
+                                GLES20.glVertexAttribPointer(ptPosLoc, 3, GLES20.GL_FLOAT, false, 0, edgeVerts)
+                                GLES20.glLineWidth(2.0f)
+                                GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, 4)
+                                GLES20.glDisableVertexAttribArray(ptPosLoc)
+                            }
+
+                            // 바닥 hit 점 (초록 수평 사각형, 작게)
+                            if (floorPaintPoints.isNotEmpty()) {
+                                GLES20.glUniform4f(ptColorLoc, 0.3f, 0.9f, 0.3f, 0.3f)
+                                val size = 0.03f
+                                val maxPts = Math.min(floorPaintPoints.size, 200)
+                                val verts = FloatArray(maxPts * 6 * 3)
+                                for (idx in 0 until maxPts) {
+                                    val pt = floorPaintPoints[idx]
                                     val x = pt[0]; val y = pt[1]; val z = pt[2]
                                     val i = idx * 18
-                                    if (vertical) {
-                                        // 벽: 수직 사각형 (XY 평면)
-                                        verts[i]=x-size; verts[i+1]=y-size; verts[i+2]=z
-                                        verts[i+3]=x+size; verts[i+4]=y-size; verts[i+5]=z
-                                        verts[i+6]=x-size; verts[i+7]=y+size; verts[i+8]=z
-                                        verts[i+9]=x+size; verts[i+10]=y-size; verts[i+11]=z
-                                        verts[i+12]=x+size; verts[i+13]=y+size; verts[i+14]=z
-                                        verts[i+15]=x-size; verts[i+16]=y+size; verts[i+17]=z
-                                    } else {
-                                        // 바닥: 수평 사각형 (XZ 평면)
-                                        verts[i]=x-size; verts[i+1]=y; verts[i+2]=z-size
-                                        verts[i+3]=x+size; verts[i+4]=y; verts[i+5]=z-size
-                                        verts[i+6]=x-size; verts[i+7]=y; verts[i+8]=z+size
-                                        verts[i+9]=x+size; verts[i+10]=y; verts[i+11]=z-size
-                                        verts[i+12]=x+size; verts[i+13]=y; verts[i+14]=z+size
-                                        verts[i+15]=x-size; verts[i+16]=y; verts[i+17]=z+size
-                                    }
+                                    verts[i]=x-size; verts[i+1]=y; verts[i+2]=z-size
+                                    verts[i+3]=x+size; verts[i+4]=y; verts[i+5]=z-size
+                                    verts[i+6]=x-size; verts[i+7]=y; verts[i+8]=z+size
+                                    verts[i+9]=x+size; verts[i+10]=y; verts[i+11]=z-size
+                                    verts[i+12]=x+size; verts[i+13]=y; verts[i+14]=z+size
+                                    verts[i+15]=x-size; verts[i+16]=y; verts[i+17]=z+size
                                 }
                                 val vb = buf(verts)
                                 GLES20.glEnableVertexAttribArray(ptPosLoc)
                                 GLES20.glVertexAttribPointer(ptPosLoc, 3, GLES20.GL_FLOAT, false, 0, vb)
-                                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, points.size * 6)
+                                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, maxPts * 6)
                                 GLES20.glDisableVertexAttribArray(ptPosLoc)
                             }
 
-                            drawPoints3D(floorPaintPoints, 0.3f, 0.9f, 0.3f, 0.4f, false)
-                            drawPoints3D(wallPaintPoints, 0.3f, 0.5f, 1.0f, 0.5f, true)
+                            // 벽 hit 점도 작게 표시 (스캔 진행 상태 보여줌)
+                            if (wallPaintPoints.isNotEmpty()) {
+                                GLES20.glUniform4f(ptColorLoc, 0.3f, 0.5f, 1.0f, 0.5f)
+                                val size = 0.02f
+                                val maxPts = Math.min(wallPaintPoints.size, 300)
+                                val verts = FloatArray(maxPts * 6 * 3)
+                                for (idx in 0 until maxPts) {
+                                    val pt = wallPaintPoints[idx]
+                                    val x = pt[0]; val y = pt[1]; val z = pt[2]
+                                    val i = idx * 18
+                                    // 카메라를 향하는 수직 사각형
+                                    verts[i]=x-size; verts[i+1]=y-size; verts[i+2]=z
+                                    verts[i+3]=x+size; verts[i+4]=y-size; verts[i+5]=z
+                                    verts[i+6]=x-size; verts[i+7]=y+size; verts[i+8]=z
+                                    verts[i+9]=x+size; verts[i+10]=y-size; verts[i+11]=z
+                                    verts[i+12]=x+size; verts[i+13]=y+size; verts[i+14]=z
+                                    verts[i+15]=x-size; verts[i+16]=y+size; verts[i+17]=z
+                                }
+                                val vb = buf(verts)
+                                GLES20.glEnableVertexAttribArray(ptPosLoc)
+                                GLES20.glVertexAttribPointer(ptPosLoc, 3, GLES20.GL_FLOAT, false, 0, vb)
+                                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, maxPts * 6)
+                                GLES20.glDisableVertexAttribArray(ptPosLoc)
+                            }
 
                             GLES20.glDepthMask(true)
                             GLES20.glDisable(GLES20.GL_BLEND)
@@ -421,6 +463,16 @@ class ArCoreTexturePlugin(
                                     break
                                 }
                             }
+                        }
+
+                        // 2초마다 벽 점으로 RANSAC → 3D 벽 quad 생성
+                        if (now - lastRansacMs >= 2000 && wallPaintPoints.size >= 6) {
+                            lastRansacMs = now
+                            // 바닥 높이 추정
+                            if (floorPaintPoints.isNotEmpty()) {
+                                floorY = floorPaintPoints.map { it[1] }.average().toFloat()
+                            }
+                            buildWallQuads()
                         }
 
                         // 500ms마다 평면 전송 (성능)
@@ -674,6 +726,77 @@ class ArCoreTexturePlugin(
             }
         }
         return grid
+    }
+
+    /// 벽 점군 → RANSAC → 3D 벽 quad
+    /// XZ 평면에서 직선(벽) 찾고, 바닥~천장 높이로 수직 quad 생성
+    private fun buildWallQuads() {
+        if (wallPaintPoints.size < 6) return
+
+        wallQuads.clear()
+        val ceilY = floorY + 2.5f // 천장 높이 추정 (바닥 + 2.5m)
+        val remaining = wallPaintPoints.toMutableList()
+        val rng = java.util.Random(42)
+
+        // 간이 RANSAC: XZ 평면에서 직선 피팅
+        while (remaining.size >= 4) {
+            var bestA = 0f; var bestB = 0f; var bestC = 0f
+            var bestInliers = mutableListOf<FloatArray>()
+
+            for (iter in 0 until 100) {
+                val i1 = rng.nextInt(remaining.size)
+                var i2 = rng.nextInt(remaining.size)
+                while (i2 == i1) i2 = rng.nextInt(remaining.size)
+
+                val p1 = remaining[i1]; val p2 = remaining[i2]
+                val dx = p2[0] - p1[0]; val dz = p2[2] - p1[2]
+                val len = Math.sqrt((dx * dx + dz * dz).toDouble()).toFloat()
+                if (len < 0.1f) continue
+
+                val a = dz / len; val b = -dx / len
+                val c = -(a * p1[0] + b * p1[2])
+
+                val inliers = remaining.filter { pt ->
+                    Math.abs(a * pt[0] + b * pt[2] + c) < 0.08f
+                }.toMutableList()
+
+                if (inliers.size > bestInliers.size) {
+                    bestInliers = inliers; bestA = a; bestB = b; bestC = c
+                }
+            }
+
+            if (bestInliers.size < 4) break
+
+            // inlier 점들의 범위로 벽 quad 생성
+            // 벽 방향 = 직선 방향 (법선에 수직)
+            val dirX = -bestB; val dirZ = bestA // 벽 방향
+            var minT = Float.MAX_VALUE; var maxT = -Float.MAX_VALUE
+            val refX = bestInliers[0][0]; val refZ = bestInliers[0][2]
+
+            for (pt in bestInliers) {
+                val t = (pt[0] - refX) * dirX + (pt[2] - refZ) * dirZ
+                if (t < minT) minT = t
+                if (t > maxT) maxT = t
+            }
+
+            // 벽 양 끝점 (바닥 높이)
+            val x1 = refX + dirX * minT; val z1 = refZ + dirZ * minT
+            val x2 = refX + dirX * maxT; val z2 = refZ + dirZ * maxT
+
+            // 4꼭지점 quad (반시계: 좌하, 우하, 우상, 좌상)
+            wallQuads.add(floatArrayOf(
+                x1, floorY, z1,    // 좌하
+                x2, floorY, z2,    // 우하
+                x2, ceilY, z2,     // 우상
+                x1, ceilY, z1,     // 좌상
+            ))
+
+            // inlier 제거
+            val inlierSet = bestInliers.toSet()
+            remaining.removeAll(inlierSet)
+        }
+
+        android.util.Log.d("ArCorePlugin", "RANSAC: ${wallPaintPoints.size}pts → ${wallQuads.size} wall quads")
     }
 
     fun dispose() = stopAr()

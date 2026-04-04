@@ -235,12 +235,161 @@ void main() {
   // ===== 테스트 5: 긴 벽 (10m x 3m) =====
   print('\n--- 테스트 5: 긴 벽 10m x 3m ---');
   final longRoom = <Point3D>[];
-  longRoom.addAll(generateWallPoints(0, 0, 10, 0, numPoints: 50)); // 긴 벽!
+  longRoom.addAll(generateWallPoints(0, 0, 10, 0, numPoints: 50));
   longRoom.addAll(generateWallPoints(10, 0, 10, 3, numPoints: 15));
   longRoom.addAll(generateWallPoints(10, 3, 0, 3, numPoints: 50));
   longRoom.addAll(generateWallPoints(0, 3, 0, 0, numPoints: 15));
 
   _runTest(longRoom, expectedArea: 30.0, expectedCorners: 4);
+
+  // ============================================================
+  // 하드코어 테스트: 꺾인 다각형 방
+  // ============================================================
+  print('\n${"=" * 60}');
+  print('하드코어 테스트: 꺾인 다각형 방');
+  print('=' * 60);
+
+  // ===== 테스트 6: T자형 방 (8코너) =====
+  //   (1,3)---(3,3)
+  //     |       |
+  // (0,2)-(1,2) (3,2)-(4,2)
+  //   |               |
+  // (0,0)-----------(4,0)
+  print('\n--- 테스트 6: T자형 방 (8코너) ---');
+  final tShape = <Point3D>[];
+  tShape.addAll(generateWallPoints(0, 0, 4, 0, numPoints: 25));
+  tShape.addAll(generateWallPoints(4, 0, 4, 2, numPoints: 15));
+  tShape.addAll(generateWallPoints(4, 2, 3, 2, numPoints: 10));
+  tShape.addAll(generateWallPoints(3, 2, 3, 3, numPoints: 10));
+  tShape.addAll(generateWallPoints(3, 3, 1, 3, numPoints: 15));
+  tShape.addAll(generateWallPoints(1, 3, 1, 2, numPoints: 10));
+  tShape.addAll(generateWallPoints(1, 2, 0, 2, numPoints: 10));
+  tShape.addAll(generateWallPoints(0, 2, 0, 0, numPoints: 15));
+  final tArea = 4.0 * 2.0 + 2.0 * 1.0; // 8 + 2 = 10
+  print('실제 면적: $tArea m²');
+  _runTest(tShape, expectedArea: tArea, expectedCorners: 8);
+
+  // ===== 테스트 7: ㄷ자형 방 (8코너) =====
+  // (0,4)-----------(5,4)
+  //   |               |
+  // (0,3)-(3,3) (3,1)-(5,1)
+  //         |     |
+  // (0,0)-(3,0)-(3,0)
+  // 실제: (0,0)-(5,0)-(5,1)-(3,1)-(3,3)-(5,3) 아님
+  // 좀 더 정확히:
+  // (0,0)-(5,0)-(5,4)-(0,4)-(0,3)-(3,3)-(3,1)-(0,1)
+  print('\n--- 테스트 7: ㄷ자형 방 (8코너) ---');
+  final uShape = <Point3D>[];
+  uShape.addAll(generateWallPoints(0, 0, 5, 0, numPoints: 30));
+  uShape.addAll(generateWallPoints(5, 0, 5, 4, numPoints: 25));
+  uShape.addAll(generateWallPoints(5, 4, 0, 4, numPoints: 30));
+  uShape.addAll(generateWallPoints(0, 4, 0, 3, numPoints: 10));
+  uShape.addAll(generateWallPoints(0, 3, 3, 3, numPoints: 20));
+  uShape.addAll(generateWallPoints(3, 3, 3, 1, numPoints: 15));
+  uShape.addAll(generateWallPoints(3, 1, 0, 1, numPoints: 20));
+  uShape.addAll(generateWallPoints(0, 1, 0, 0, numPoints: 10));
+  // 면적 = 5*4 - 3*2 = 14
+  _runTest(uShape, expectedArea: 14.0, expectedCorners: 8);
+
+  // ===== 테스트 8: 45도 사선 벽이 여러 개인 팔각형 =====
+  // 정팔각형 근사 (반지름 3m)
+  print('\n--- 테스트 8: 정팔각형 (반지름 3m) ---');
+  final octagon = <Point3D>[];
+  final octCorners = <Point3D>[];
+  for (int i = 0; i < 8; i++) {
+    final angle = i * math.pi / 4;
+    octCorners.add(Point3D(3 * math.cos(angle), 0, 3 * math.sin(angle)));
+  }
+  for (int i = 0; i < 8; i++) {
+    final j = (i + 1) % 8;
+    octagon.addAll(generateWallPoints(
+      octCorners[i].x, octCorners[i].z,
+      octCorners[j].x, octCorners[j].z,
+      numPoints: 15));
+  }
+  final octArea = calcArea(octCorners);
+  print('실제 면적: ${octArea.toStringAsFixed(1)} m²');
+  _runTest(octagon, expectedArea: octArea, expectedCorners: 8);
+
+  // ===== 테스트 9: 지그재그 복도형 (10코너) =====
+  // (0,0)-(2,0)-(2,1)-(4,1)-(4,0)-(6,0)-(6,2)-(4,2)-(4,1.5 아님)
+  // 단순화: 계단형
+  // (0,0)-(2,0)-(2,1)-(4,1)-(4,2)-(0,2)
+  print('\n--- 테스트 9: 계단형 방 (6코너, 사선 없는 꺾임) ---');
+  final stair = <Point3D>[];
+  stair.addAll(generateWallPoints(0, 0, 2, 0, numPoints: 15));
+  stair.addAll(generateWallPoints(2, 0, 2, 1, numPoints: 10));
+  stair.addAll(generateWallPoints(2, 1, 4, 1, numPoints: 15));
+  stair.addAll(generateWallPoints(4, 1, 4, 2, numPoints: 10));
+  stair.addAll(generateWallPoints(4, 2, 0, 2, numPoints: 25));
+  stair.addAll(generateWallPoints(0, 2, 0, 0, numPoints: 15));
+  // 면적 = 2*1 + 2*2 = 2+4 = 아님. 2*2 + 2*1 = 6
+  // Shoelace: (0,0)(2,0)(2,1)(4,1)(4,2)(0,2) = 6
+  final stairCorners = [Point3D(0,0,0), Point3D(2,0,0), Point3D(2,0,1), Point3D(4,0,1), Point3D(4,0,2), Point3D(0,0,2)];
+  final stairArea = calcArea(stairCorners);
+  print('실제 면적: ${stairArea.toStringAsFixed(1)} m²');
+  _runTest(stair, expectedArea: stairArea, expectedCorners: 6);
+
+  // ===== 테스트 10: 극심한 노이즈 (15cm) + 점 적음 =====
+  print('\n--- 테스트 10: 극심한 노이즈 15cm + 점 적음 (4x3) ---');
+  final extreme = <Point3D>[];
+  extreme.addAll(generateWallPoints(0, 0, 4, 0, numPoints: 10, noise: 0.15));
+  extreme.addAll(generateWallPoints(4, 0, 4, 3, numPoints: 8, noise: 0.15));
+  extreme.addAll(generateWallPoints(4, 3, 0, 3, numPoints: 10, noise: 0.15));
+  extreme.addAll(generateWallPoints(0, 3, 0, 0, numPoints: 8, noise: 0.15));
+  _runTest(extreme, expectedArea: 12.0, expectedCorners: 4);
+
+  // ===== 테스트 11: 아주 작은 방 1.5m x 1.2m (화장실) =====
+  print('\n--- 테스트 11: 작은 방 1.5m x 1.2m (화장실) ---');
+  final small = <Point3D>[];
+  small.addAll(generateWallPoints(0, 0, 1.5, 0, numPoints: 12));
+  small.addAll(generateWallPoints(1.5, 0, 1.5, 1.2, numPoints: 10));
+  small.addAll(generateWallPoints(1.5, 1.2, 0, 1.2, numPoints: 12));
+  small.addAll(generateWallPoints(0, 1.2, 0, 0, numPoints: 10));
+  _runTest(small, expectedArea: 1.8, expectedCorners: 4);
+
+  // ===== 테스트 12: 30도 사선 벽 + 직각 벽 혼합 (현실적) =====
+  // (0,0)-(3,0)-(4.5,1)-(4.5,3)-(0,3) — 한쪽만 사선
+  print('\n--- 테스트 12: 30도 사선 + 직각 혼합 ---');
+  final mixed = <Point3D>[];
+  mixed.addAll(generateWallPoints(0, 0, 3, 0, numPoints: 20));
+  mixed.addAll(generateWallPoints(3, 0, 4.5, 1, numPoints: 12)); // 30도 사선
+  mixed.addAll(generateWallPoints(4.5, 1, 4.5, 3, numPoints: 15));
+  mixed.addAll(generateWallPoints(4.5, 3, 0, 3, numPoints: 25));
+  mixed.addAll(generateWallPoints(0, 3, 0, 0, numPoints: 20));
+  final mixCorners = [Point3D(0,0,0), Point3D(3,0,0), Point3D(4.5,0,1), Point3D(4.5,0,3), Point3D(0,0,3)];
+  final mixArea = calcArea(mixCorners);
+  print('실제 면적: ${mixArea.toStringAsFixed(1)} m²');
+  _runTest(mixed, expectedArea: mixArea, expectedCorners: 5);
+
+  // ===== 테스트 13: 짐이 많은 방 시뮬 (벽 일부만 보임) =====
+  // 4x3 방인데 각 벽의 30%만 스캔됨 (짐에 가려서)
+  print('\n--- 테스트 13: 짐이 많은 방 (벽 30%만 보임) ---');
+  final partial = <Point3D>[];
+  // 남벽: 0~1.2m 구간만 보임
+  partial.addAll(generateWallPoints(0, 0, 1.2, 0, numPoints: 10));
+  // 동벽: 0.5~1.5m 구간만 보임
+  partial.addAll(generateWallPoints(4, 0.5, 4, 1.5, numPoints: 8));
+  // 북벽: 2.5~4m 구간만 보임
+  partial.addAll(generateWallPoints(2.5, 3, 4, 3, numPoints: 10));
+  // 서벽: 1~2.5m 구간만 보임
+  partial.addAll(generateWallPoints(0, 1, 0, 2.5, numPoints: 10));
+  _runTest(partial, expectedArea: 12.0, expectedCorners: 4);
+
+  // ===== 테스트 14: 실제 테스트 환경 (오각형 + 짐 + 노이즈) =====
+  // 사용자의 실제 방: 오각형, 짐 많음, 노이즈 8cm
+  // (0,0)-(3.5,0)-(4,1.5)-(2.5,3.5)-(0,2.8)
+  print('\n--- 테스트 14: 실제 테스트 환경 시뮬 (오각형+짐+노이즈) ---');
+  final real = <Point3D>[];
+  real.addAll(generateWallPoints(0, 0, 3.5, 0, numPoints: 15, noise: 0.08));
+  real.addAll(generateWallPoints(3.5, 0, 4, 1.5, numPoints: 8, noise: 0.08)); // 사선, 점 적음
+  real.addAll(generateWallPoints(4, 1.5, 2.5, 3.5, numPoints: 10, noise: 0.08)); // 사선
+  real.addAll(generateWallPoints(2.5, 3.5, 0, 2.8, numPoints: 12, noise: 0.08)); // 사선
+  real.addAll(generateWallPoints(0, 2.8, 0, 0, numPoints: 12, noise: 0.08));
+  final realCorners = [Point3D(0,0,0), Point3D(3.5,0,0), Point3D(4,0,1.5), Point3D(2.5,0,3.5), Point3D(0,0,2.8)];
+  final realArea = calcArea(realCorners);
+  print('실제 면적: ${realArea.toStringAsFixed(1)} m²');
+  _runTest(real, expectedArea: realArea, expectedCorners: 5);
 }
 
 void _runTest(List<Point3D> points, {required double expectedArea, required int expectedCorners}) {
