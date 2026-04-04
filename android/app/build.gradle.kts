@@ -41,7 +41,7 @@ android {
 
 dependencies {
     // ARCore SDK (Sceneform 없이 직접 사용)
-    implementation("com.google.ar:core:1.44.0")
+    implementation("com.google.ar:core:1.46.0")
 }
 
 flutter {

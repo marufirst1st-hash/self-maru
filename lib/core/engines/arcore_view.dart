@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -96,7 +97,11 @@ class ArCoreController {
   final _flashEdgesController = StreamController<List<Map<String, dynamic>>>.broadcast();
   final _cornerCandidatesController = StreamController<List<Map<String, dynamic>>>.broadcast();
   final _cameraPoseController = StreamController<Offset>.broadcast();
+  final _cameraStateController = StreamController<ArCameraState>.broadcast();
+  final _centerHitController = StreamController<ArCenterHit>.broadcast();
   final _errorController = StreamController<String>.broadcast();
+
+  Stream<ArCenterHit> get onCenterHit => _centerHitController.stream;
 
   Stream<ArHitResult> get onPlaneTap => _planeTapController.stream;
   Stream<bool> get onPlaneDetected => _planeDetectedController.stream;
@@ -106,6 +111,7 @@ class ArCoreController {
   Stream<List<Map<String, dynamic>>> get onFlashEdges => _flashEdgesController.stream;
   Stream<List<Map<String, dynamic>>> get onCornerCandidates => _cornerCandidatesController.stream;
   Stream<Offset> get onCameraPose => _cameraPoseController.stream;
+  Stream<ArCameraState> get onCameraState => _cameraStateController.stream;
   Stream<String> get onError => _errorController.stream;
 
   ArCoreController._(this._channel) {
@@ -173,6 +179,7 @@ class ArCoreController {
             extentX: (data['extentX'] as num).toDouble(),
             extentZ: (data['extentZ'] as num).toDouble(),
             polygon: poly,
+            polygon3D: Float64List.fromList(polyRaw),
           );
         }).toList();
         _planesUpdatedController.add(planes);
@@ -181,6 +188,26 @@ class ArCoreController {
         final x = (data['x'] as num).toDouble();
         final z = (data['z'] as num).toDouble();
         _cameraPoseController.add(Offset(x, z));
+        // view/projection 행렬이 있으면 ArCameraState 전송
+        if (data.containsKey('viewMatrix') && data.containsKey('projMatrix')) {
+          final viewRaw = (data['viewMatrix'] as List).map((e) => (e as num).toDouble()).toList();
+          final projRaw = (data['projMatrix'] as List).map((e) => (e as num).toDouble()).toList();
+          _cameraStateController.add(ArCameraState(
+            position: Offset(x, z),
+            y: (data['y'] as num).toDouble(),
+            viewMatrix: Float64List.fromList(viewRaw),
+            projMatrix: Float64List.fromList(projRaw),
+          ));
+        }
+      case 'onCenterHit':
+        final data = Map<String, dynamic>.from(call.arguments as Map);
+        _centerHitController.add(ArCenterHit(
+          x: (data['x'] as num).toDouble(),
+          y: (data['y'] as num).toDouble(),
+          z: (data['z'] as num).toDouble(),
+          distance: (data['distance'] as num).toDouble(),
+          type: data['type'] as String,
+        ));
       case 'onError':
         _errorController.add(call.arguments?.toString() ?? 'Unknown error');
     }
@@ -195,6 +222,8 @@ class ArCoreController {
     _flashEdgesController.close();
     _cornerCandidatesController.close();
     _cameraPoseController.close();
+    _cameraStateController.close();
+    _centerHitController.close();
     _errorController.close();
   }
 }
@@ -243,7 +272,8 @@ class ArPlaneData {
   final double cx, cy, cz;
   final double nx, ny, nz;
   final double extentX, extentZ;
-  final List<Offset> polygon; // 2D 경계 (x, z)
+  final List<Offset> polygon; // 2D 경계 (x, z) - 기존 호환
+  final Float64List polygon3D; // 3D 경계 (x,y,z,x,y,z,...) - AR 투영용
 
   const ArPlaneData({
     required this.id, required this.type,
@@ -251,9 +281,66 @@ class ArPlaneData {
     required this.nx, required this.ny, required this.nz,
     required this.extentX, required this.extentZ,
     required this.polygon,
+    required this.polygon3D,
   });
 
   bool get isFloor => type == 'floor';
   bool get isWall => type == 'wall';
   Offset get center2D => Offset(cx, cz);
+}
+
+/// 카메라 상태: 위치 + view/projection 행렬 (AR 면 투영용)
+class ArCameraState {
+  final Offset position; // (x, z)
+  final double y;        // 카메라 높이
+  final Float64List viewMatrix;  // 4x4 column-major
+  final Float64List projMatrix;  // 4x4 column-major
+
+  const ArCameraState({
+    required this.position,
+    required this.y,
+    required this.viewMatrix,
+    required this.projMatrix,
+  });
+
+  /// 3D 월드 좌표 → 2D 화면 좌표 (원근 투영)
+  /// 반환: null이면 카메라 뒤쪽 (안 보임)
+  Offset? projectToScreen(double wx, double wy, double wz, double screenW, double screenH) {
+    // view * worldPoint (column-major: M[col*4+row])
+    final vx = viewMatrix[0]*wx + viewMatrix[4]*wy + viewMatrix[8]*wz + viewMatrix[12];
+    final vy = viewMatrix[1]*wx + viewMatrix[5]*wy + viewMatrix[9]*wz + viewMatrix[13];
+    final vz = viewMatrix[2]*wx + viewMatrix[6]*wy + viewMatrix[10]*wz + viewMatrix[14];
+    final vw = viewMatrix[3]*wx + viewMatrix[7]*wy + viewMatrix[11]*wz + viewMatrix[15];
+
+    // proj * viewPoint
+    final cx = projMatrix[0]*vx + projMatrix[4]*vy + projMatrix[8]*vz + projMatrix[12]*vw;
+    final cy = projMatrix[1]*vx + projMatrix[5]*vy + projMatrix[9]*vz + projMatrix[13]*vw;
+    final cw = projMatrix[3]*vx + projMatrix[7]*vy + projMatrix[11]*vz + projMatrix[15]*vw;
+
+    if (cw <= 0.001) return null; // 카메라 뒤쪽
+
+    // NDC → 화면 좌표
+    final ndcX = cx / cw;
+    final ndcY = cy / cw;
+    return Offset(
+      (ndcX + 1.0) / 2.0 * screenW,
+      (1.0 - ndcY) / 2.0 * screenH,
+    );
+  }
+}
+
+/// 화면 중앙 연속 hitTest 결과
+class ArCenterHit {
+  final double x, y, z;   // 3D 월드 좌표
+  final double distance;   // 카메라로부터 거리
+  final String type;       // 'wall', 'floor', 'other'
+
+  const ArCenterHit({
+    required this.x, required this.y, required this.z,
+    required this.distance, required this.type,
+  });
+
+  bool get isWall => type == 'wall';
+  bool get isFloor => type == 'floor';
+  Offset get floorPosition => Offset(x, z);
 }

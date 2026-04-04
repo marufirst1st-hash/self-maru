@@ -21,6 +21,7 @@ class PdrEngine {
   Offset _position = Offset.zero;
   double _heading = 0; // 라디안
   int _stepCount = 0;
+  double _pitch = 0; // 폰 기울기 (라디안). 0=수직(벽), -π/2=수평(바닥)
 
   // 중력 분리용
   double _gravX = 0, _gravY = 0, _gravZ = 9.8;
@@ -42,6 +43,9 @@ class PdrEngine {
   Offset get position => _position;
   double get heading => _heading;
   int get stepCount => _stepCount;
+  double get pitch => _pitch;
+  /// 폰이 벽을 비추고 있는지 (-40도 이상이면 벽 방향)
+  bool get isLookingAtWall => _pitch > -0.7; // ~-40도
 
   PdrEngine({
     this.stepThresholdSigma = 1.2,
@@ -76,6 +80,13 @@ class PdrEngine {
     final linearX = ax - _gravX;
     final linearY = ay - _gravY;
     final linearZ = az - _gravZ;
+
+    // 폰 기울기(pitch): 중력 Z 성분으로 판단
+    // gravZ/|g| ≈ -1 → 바닥 비추는 중, ≈ 0 → 벽 비추는 중
+    final gravMag = MathUtils.magnitude(_gravX, _gravY, _gravZ);
+    if (gravMag > 0.1) {
+      _pitch = -(_gravZ / gravMag).clamp(-1.0, 1.0);
+    }
 
     // 공식 ① 벡터 크기
     final mag = MathUtils.magnitude(linearX, linearY, linearZ);
